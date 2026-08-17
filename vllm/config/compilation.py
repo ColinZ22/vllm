@@ -771,6 +771,7 @@ class CompilationConfig:
         "vllm::qwen3_8_flash_next_qsa_with_output",
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
+        "vllm::qwen_gdn_attention_core_fused_norm_packed",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::sparse_attn_indexer",
