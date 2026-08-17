@@ -94,6 +94,13 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "QianfanOCRVisionConfig": "vllm.transformers_utils.configs.qianfan_ocr",
     "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
     "Qwen3NextConfig": "vllm.transformers_utils.configs.qwen3_next",
+    "Qwen3_8FlashNextConfig": "vllm.transformers_utils.configs.qwen3_8_flash_next",
+    "Qwen3_8FlashNextTextConfig": (
+        "vllm.transformers_utils.configs.qwen3_8_flash_next"
+    ),
+    "Qwen3_8FlashNextVisionConfig": (
+        "vllm.transformers_utils.configs.qwen3_8_flash_next"
+    ),
     "Qwen3_5Config": "vllm.transformers_utils.configs.qwen3_5",
     "Qwen3_5TextConfig": "vllm.transformers_utils.configs.qwen3_5",
     "Qwen3_5MoeConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
@@ -182,6 +189,9 @@ __all__ = [
     "QianfanOCRVisionConfig",
     "Qwen3ASRConfig",
     "Qwen3NextConfig",
+    "Qwen3_8FlashNextConfig",
+    "Qwen3_8FlashNextTextConfig",
+    "Qwen3_8FlashNextVisionConfig",
     "Qwen3_5Config",
     "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",

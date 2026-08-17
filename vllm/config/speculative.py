@@ -47,6 +47,7 @@ MTPModelTypes = Literal[
     "exaone_moe_mtp",
     "exaone4_5_mtp",
     "qwen3_next_mtp",
+    "qwen3_8_flash_next_mtp",
     "qwen3_5_mtp",
     "longcat_flash_mtp",
     "bailing_hybrid_v3_mtp",
@@ -507,6 +508,18 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
+            )
+        if hf_config.model_type in {"qwen3_8_flash_next", "qwen3_8_flash_next_text"}:
+            hf_config.model_type = "qwen3_8_flash_next_mtp"
+        if hf_config.model_type == "qwen3_8_flash_next_mtp":
+            text_config = get_hf_text_config(hf_config)
+            n_predict = getattr(
+                text_config,
+                "mtp_num_hidden_layers",
+                getattr(text_config, "num_nextn_predict_layers", None),
+            )
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Qwen3_8FlashNextMTP"]}
             )
 
         architectures = getattr(hf_config, "architectures", []) or []

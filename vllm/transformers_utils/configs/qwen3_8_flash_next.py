@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Compatibility exports for the package-owned Qwen3.8-Flash-Next configs."""
+
+from vllm.models.qwen3_8_flash_next.config import (
+    Qwen3_8FlashNextConfig,
+    Qwen3_8FlashNextTextConfig,
+    Qwen3_8FlashNextVisionConfig,
+)
+
+__all__ = [
+    "Qwen3_8FlashNextConfig",
+    "Qwen3_8FlashNextTextConfig",
+    "Qwen3_8FlashNextVisionConfig",
+]

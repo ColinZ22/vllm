@@ -767,6 +767,8 @@ class CompilationConfig:
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
         "vllm::short_conv",
+        "vllm::qwen3_8_flash_next_ple_short_conv",
+        "vllm::qwen3_8_flash_next_qsa_with_output",
         "vllm::linear_attention",
         "vllm::qwen_gdn_attention_core",
         "vllm::gdn_attention_core_xpu",

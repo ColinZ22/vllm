@@ -104,6 +104,41 @@ def _make_speculator(
     return speculator
 
 
+def test_mtp_speculator_uses_configured_feedback_hidden_size():
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(),
+        get_speculative_hidden_size=lambda: 64,
+        get_vocab_size=lambda: 32,
+    )
+    speculative_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=3,
+        draft_model_config=draft_model_config,
+        use_local_argmax_reduction=False,
+        draft_sample_method="greedy",
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2,
+            max_num_batched_tokens=8,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=32,
+            dtype=torch.float32,
+            use_fp64_gumbel=False,
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+        ),
+    )
+
+    speculator = _TestSpeculator(vllm_config, torch.device("cpu"))
+
+    assert speculator.hidden_size == 64
+
+
 def test_mm_support_configured_after_model_load(monkeypatch):
     target_model_config = object()
     draft_model_config = object()
