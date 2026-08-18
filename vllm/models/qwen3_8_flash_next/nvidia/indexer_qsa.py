@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen3.8-Flash-Next weight-free QSA indexer and reference runtime."""
+"""Qwen3.8-Flash-Next weight-free QSA indexer."""
 
 from __future__ import annotations
 
@@ -23,18 +23,6 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
-    gather_packed_qsa_keys,
-    qsa_group_state,
-    store_qsa_cache_rows,
-)
-from ..common.qsa_reference import (
-    average_pool_qsa_keys,
-    build_qsa_row_ranges,
-    expand_qsa_block_indices,
-    qsa_mqa_decode_reference,
-    qsa_relative_topk,
-    select_qsa_prefill_tokens_reference,
-    validate_qsa_config,
 )
 
 
@@ -115,7 +103,6 @@ class QSAIndexer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        validate_qsa_config(config)
         if vllm_config.cache_config is None:
             raise ValueError("QSA requires a paged KV cache")
         if vllm_config.model_config.dtype != torch.bfloat16:
@@ -127,7 +114,6 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
-        self.block_topk = self.token_topk // self.compress_ratio
         self.rotary_emb = rotary_emb
         self.prefix = prefix
 
@@ -235,44 +221,9 @@ class QSAIndexer(nn.Module):
         num_tokens = raw_metadata.num_actual_tokens
         raw_key_cache = self.raw_key_cache.key_cache
         rope_position_cache = self.raw_key_cache.rope_position_cache
-        if token_k.is_cuda:
-            from .ops.qsa import (
-                qsa_compress_groups_with_ratio,
-                qsa_store_cache_rows,
-            )
+        from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
 
-            qsa_store_cache_rows(
-                raw_key_cache,
-                raw_metadata.slot_mapping,
-                token_k[:num_tokens],
-            )
-            if rope_position_cache is not None:
-                position_rows = canonical_qsa_rope_positions(positions)[:num_tokens].to(
-                    device=rope_position_cache.device
-                )
-                qsa_store_cache_rows(
-                    rope_position_cache,
-                    raw_metadata.slot_mapping,
-                    position_rows,
-                )
-            pooled, first_positions = qsa_compress_groups_with_ratio(
-                raw_key_cache,
-                raw_metadata.block_table,
-                raw_metadata.token_to_req,
-                raw_metadata.logical_positions,
-                compressed_metadata.slot_mapping,
-                self.compress_ratio,
-                rope_position_cache,
-            )
-            normalized = self.normalize_compressed_keys(pooled, first_positions)
-            qsa_store_cache_rows(
-                self.compressed_key_cache.kv_cache,
-                compressed_metadata.slot_mapping,
-                normalized,
-            )
-            return
-
-        store_qsa_cache_rows(
+        qsa_store_cache_rows(
             raw_key_cache,
             raw_metadata.slot_mapping,
             token_k[:num_tokens],
@@ -281,101 +232,28 @@ class QSAIndexer(nn.Module):
             position_rows = canonical_qsa_rope_positions(positions)[:num_tokens].to(
                 device=rope_position_cache.device
             )
-            store_qsa_cache_rows(
+            qsa_store_cache_rows(
                 rope_position_cache,
                 raw_metadata.slot_mapping,
                 position_rows,
             )
-
-        boundary_rows = torch.nonzero(
-            compressed_metadata.slot_mapping >= 0, as_tuple=False
-        ).flatten()
-        if boundary_rows.numel() == 0:
-            return
-        key_groups, first_positions = qsa_group_state(
+        pooled, first_positions = qsa_compress_groups_with_ratio(
             raw_key_cache,
-            raw_metadata,
-            boundary_rows,
+            raw_metadata.block_table,
+            raw_metadata.token_to_req,
+            raw_metadata.logical_positions,
+            compressed_metadata.slot_mapping,
             self.compress_ratio,
             rope_position_cache,
         )
-        pooled = average_pool_qsa_keys(key_groups)
         normalized = self.normalize_compressed_keys(pooled, first_positions)
-        store_qsa_cache_rows(
+        qsa_store_cache_rows(
             self.compressed_key_cache.kv_cache,
-            compressed_metadata.slot_mapping.index_select(0, boundary_rows),
+            compressed_metadata.slot_mapping,
             normalized,
         )
 
-    def _select_reference(
-        self,
-        q: torch.Tensor,
-        metadata: QSAForwardMetadata,
-    ) -> torch.Tensor:
-        compressed_lengths = torch.div(
-            metadata.seq_lens,
-            self.compress_ratio,
-            rounding_mode="floor",
-        ).to(torch.int32)
-        compressed_keys, _ = gather_packed_qsa_keys(
-            self.compressed_key_cache.kv_cache,
-            metadata.block_table,
-            compressed_lengths,
-        )
-        row_starts, row_ends, _ = build_qsa_row_ranges(
-            metadata.seq_lens,
-            metadata.logical_positions,
-            metadata.token_to_req,
-            self.compress_ratio,
-        )
-        row_sequence_lengths = metadata.seq_lens.index_select(
-            0, metadata.token_to_req.long()
-        )
-        return select_qsa_prefill_tokens_reference(
-            q,
-            compressed_keys,
-            row_starts,
-            row_ends,
-            metadata.logical_positions,
-            row_sequence_lengths,
-            self.token_topk,
-            self.compress_ratio,
-        )
-
-    def _select_decode_reference(
-        self,
-        q: torch.Tensor,
-        metadata: QSAForwardMetadata,
-    ) -> torch.Tensor:
-        compressed_lengths = torch.div(
-            metadata.seq_lens,
-            self.compress_ratio,
-            rounding_mode="floor",
-        ).to(torch.int32)
-        logits = qsa_mqa_decode_reference(
-            q,
-            self.compressed_key_cache.kv_cache,
-            metadata.block_table,
-            compressed_lengths,
-            int(compressed_lengths.max().item()) if compressed_lengths.numel() else 0,
-        )
-        row_starts = torch.zeros_like(compressed_lengths)
-        block_indices = qsa_relative_topk(
-            logits,
-            row_starts,
-            compressed_lengths,
-            self.block_topk,
-        )
-        row_seq_lens = metadata.seq_lens.index_select(0, metadata.token_to_req.long())
-        return expand_qsa_block_indices(
-            block_indices,
-            metadata.logical_positions,
-            row_seq_lens,
-            self.compress_ratio,
-            self.token_topk,
-        )
-
-    def _select_cuda(
+    def _select(
         self,
         q: torch.Tensor,
         metadata: QSAForwardMetadata,
@@ -426,21 +304,7 @@ class QSAIndexer(nn.Module):
             raw_metadata,
             compressed_metadata,
         )
-        if q.is_cuda:
-            return self._select_cuda(q, compressed_metadata, out)
-        query_lens = torch.diff(compressed_metadata.query_start_loc)
-        is_uniform_decode = bool(query_lens.numel()) and bool(
-            torch.all(query_lens == 1).item()
-        )
-        result = (
-            self._select_decode_reference(q, compressed_metadata)
-            if is_uniform_decode
-            else self._select_reference(q, compressed_metadata)
-        )
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        return self._select(q, compressed_metadata, out)
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]

@@ -8,65 +8,9 @@ import math
 
 import torch
 
-from vllm.models.qwen3_8_flash_next.common.qsa_reference import (
-    qsa_mqa_decode_reference,
-    qsa_mqa_prefill_reference,
-    qsa_sparse_attention_reference,
-)
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
-
-
-@triton.jit
-def _qsa_mqa_prefill_kernel(
-    q_ptr,
-    k_ptr,
-    starts_ptr,
-    ends_ptr,
-    logits_ptr,
-    stride_q_row,
-    stride_q_head,
-    stride_q_dim,
-    stride_k_row,
-    stride_k_dim,
-    stride_logits_row,
-    num_rows,
-    num_keys,
-    score_divisor,
-    NUM_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-) -> None:
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    dims = tl.arange(0, BLOCK_D)
-    start = tl.load(starts_ptr + row)
-    end = tl.load(ends_ptr + row)
-    valid_columns = (columns < num_keys) & (columns >= start) & (columns < end)
-    score = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
-    for head in tl.static_range(0, NUM_HEADS):
-        query = tl.load(
-            q_ptr + row * stride_q_row + head * stride_q_head + dims * stride_q_dim,
-            mask=dims < HEAD_DIM,
-            other=0.0,
-        ).to(tl.float32)
-        keys = tl.load(
-            k_ptr + columns[:, None] * stride_k_row + dims[None, :] * stride_k_dim,
-            mask=valid_columns[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-        ).to(tl.float32)
-        dot = tl.sum(keys * query[None, :], axis=1)
-        score += tl.maximum(dot, 0.0)
-
-    score /= score_divisor
-    tl.store(
-        logits_ptr + row * stride_logits_row + columns,
-        tl.where(valid_columns, score, -float("inf")),
-        mask=(row < num_rows) & (columns < num_keys),
-    )
 
 
 @triton.jit
@@ -516,61 +460,6 @@ def _validate_mqa(q: torch.Tensor) -> None:
         raise ValueError("QSA query must be [rows, heads, head_dim]")
 
 
-def qsa_mqa_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    score_scale: float | None = None,
-    *,
-    allow_reference: bool = False,
-) -> torch.Tensor:
-    """Compute packed weight-free MQA scores without a head workspace."""
-
-    _validate_mqa(q)
-    if not q.is_cuda:
-        return qsa_mqa_prefill_reference(q, k, row_starts, row_ends, score_scale)
-    if not HAS_TRITON:
-        if allow_reference:
-            return qsa_mqa_prefill_reference(q, k, row_starts, row_ends, score_scale)
-        raise RuntimeError("QSA CUDA scoring requires Triton")
-    if k.ndim != 3 or k.shape[1] != 1 or k.shape[2] != q.shape[2]:
-        raise ValueError("QSA packed keys must be [keys, 1, head_dim]")
-    if row_starts.shape != (q.shape[0],) or row_ends.shape != (q.shape[0],):
-        raise ValueError("QSA row ranges must match query rows")
-    score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
-    if score_divisor <= 0:
-        raise ValueError("QSA score scale must be positive")
-
-    logits = torch.empty((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
-    if not q.shape[0] or not k.shape[0]:
-        return logits
-    block_n = 32
-    block_d = triton.next_power_of_2(q.shape[2])
-    _qsa_mqa_prefill_kernel[(q.shape[0], triton.cdiv(k.shape[0], block_n))](
-        q,
-        k,
-        row_starts,
-        row_ends,
-        logits,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(2),
-        logits.stride(0),
-        q.shape[0],
-        k.shape[0],
-        float(score_divisor),
-        NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
-        BLOCK_N=block_n,
-        BLOCK_D=block_d,
-        num_warps=4,
-    )
-    return logits
-
-
 def qsa_mqa_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -639,40 +528,6 @@ def qsa_mqa_paged(
         num_warps=4,
     )
     return logits
-
-
-def qsa_mqa_decode(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_model_len: int,
-    score_scale: float | None = None,
-    *,
-    allow_reference: bool = False,
-) -> torch.Tensor:
-    """Compute paged decode scores with one request per query row."""
-
-    if not q.is_cuda:
-        return qsa_mqa_decode_reference(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
-        )
-    if not HAS_TRITON:
-        if allow_reference:
-            return qsa_mqa_decode_reference(
-                q, k_cache, page_table, context_lens, max_model_len, score_scale
-            )
-        raise RuntimeError("QSA CUDA scoring requires Triton")
-    requests = torch.arange(q.shape[0], dtype=torch.int32, device=q.device)
-    return qsa_mqa_paged(
-        q,
-        k_cache,
-        page_table,
-        requests,
-        context_lens,
-        max_model_len,
-        score_scale,
-    )
 
 
 def qsa_relative_topk_cuda(
@@ -904,26 +759,6 @@ def qsa_sparse_paged_attention(
     return out
 
 
-def qsa_sparse_attention(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    token_slots: torch.Tensor,
-    softmax_scale: float | None = None,
-    *,
-    allow_reference: bool = False,
-) -> torch.Tensor:
-    """Run sparse attention over flat slots (reference compatibility API)."""
-
-    if not q.is_cuda or allow_reference:
-        return qsa_sparse_attention_reference(
-            q, k_cache, v_cache, token_slots, softmax_scale
-        )
-    raise ValueError(
-        "the production QSA kernel consumes logical indices and a page table"
-    )
-
-
 def qsa_store_cache_rows(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1050,12 +885,9 @@ def qsa_compress_groups_with_ratio(
 __all__ = [
     "expand_qsa_block_indices_cuda",
     "qsa_compress_groups_with_ratio",
-    "qsa_mqa_decode",
     "qsa_mqa_paged",
-    "qsa_mqa_prefill",
     "qsa_relative_topk_cuda",
     "qsa_select_paged_tokens",
-    "qsa_sparse_attention",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",
 ]

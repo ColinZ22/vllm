@@ -36,135 +36,6 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
-def _validate_qsa_cache(cache: torch.Tensor) -> None:
-    if cache.ndim != 4 or cache.shape[2] != 1:
-        raise ValueError(
-            "QSA side cache must be [blocks, block_size, 1, width], "
-            f"got {tuple(cache.shape)}"
-        )
-
-
-def store_qsa_cache_rows(
-    cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    rows: torch.Tensor,
-) -> None:
-    """Store rows at non-negative flat slots; ``-1`` slots are padding."""
-
-    _validate_qsa_cache(cache)
-    if rows.ndim == 3:
-        if rows.shape[1] != 1:
-            raise ValueError("QSA side-cache rows must have one KV head")
-        rows = rows[:, 0]
-    if rows.ndim != 2 or rows.shape[-1] != cache.shape[-1]:
-        raise ValueError(
-            f"QSA cache rows must be [tokens, {cache.shape[-1]}], "
-            f"got {tuple(rows.shape)}"
-        )
-    if slot_mapping.ndim != 1 or slot_mapping.numel() != rows.shape[0]:
-        raise ValueError("QSA slot mapping must have one entry per row")
-
-    slots = slot_mapping.to(device=cache.device, dtype=torch.long)
-    valid = slots >= 0
-    if torch.any(valid):
-        valid_slots = slots[valid]
-        capacity = cache.shape[0] * cache.shape[1]
-        if torch.any(valid_slots >= capacity):
-            raise ValueError("QSA slot mapping contains an out-of-range slot")
-        blocks = torch.div(valid_slots, cache.shape[1], rounding_mode="floor")
-        offsets = valid_slots.remainder(cache.shape[1])
-        cache[blocks, offsets, 0] = rows[valid].to(cache.dtype)
-
-
-def logical_to_physical_qsa_slots(
-    block_table: torch.Tensor,
-    request_indices: torch.Tensor,
-    logical_positions: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Translate request-relative logical positions into flat cache slots."""
-
-    if block_size <= 0:
-        raise ValueError("QSA cache block size must be positive")
-    if block_table.ndim != 2:
-        raise ValueError("QSA block table must be two-dimensional")
-    if request_indices.shape != logical_positions.shape:
-        request_indices = torch.broadcast_to(request_indices, logical_positions.shape)
-
-    requests = request_indices.to(device=block_table.device, dtype=torch.long)
-    positions = logical_positions.to(device=block_table.device, dtype=torch.long)
-    valid = (requests >= 0) & (requests < block_table.shape[0]) & (positions >= 0)
-    logical_blocks = torch.div(
-        positions.clamp_min(0), block_size, rounding_mode="floor"
-    )
-    valid &= logical_blocks < block_table.shape[1]
-    safe_requests = requests.clamp(0, max(block_table.shape[0] - 1, 0))
-    safe_blocks = logical_blocks.clamp(0, max(block_table.shape[1] - 1, 0))
-    if block_table.shape[0] == 0 or block_table.shape[1] == 0:
-        return torch.full_like(positions, -1)
-    physical_blocks = block_table[safe_requests, safe_blocks].long()
-    valid &= physical_blocks >= 0
-    slots = physical_blocks * block_size + positions.remainder(block_size)
-    return torch.where(valid, slots, torch.full_like(slots, -1))
-
-
-def gather_qsa_cache_rows(
-    cache: torch.Tensor,
-    block_table: torch.Tensor,
-    request_indices: torch.Tensor,
-    logical_positions: torch.Tensor,
-) -> torch.Tensor:
-    """Gather rows addressed by request-relative logical positions."""
-
-    _validate_qsa_cache(cache)
-    slots = logical_to_physical_qsa_slots(
-        block_table,
-        request_indices,
-        logical_positions,
-        cache.shape[1],
-    )
-    if torch.any(slots < 0):
-        raise ValueError("QSA attempted to gather an unallocated logical slot")
-    capacity = cache.shape[0] * cache.shape[1]
-    if torch.any(slots >= capacity):
-        raise ValueError("QSA logical slot resolves outside the side cache")
-    blocks = torch.div(slots, cache.shape[1], rounding_mode="floor")
-    offsets = slots.remainder(cache.shape[1])
-    return cache[blocks, offsets, 0]
-
-
-def gather_packed_qsa_keys(
-    cache: torch.Tensor,
-    block_table: torch.Tensor,
-    compressed_lengths: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather compressed keys into sequence-packed order for reference MQA."""
-
-    if compressed_lengths.ndim != 1:
-        raise ValueError("QSA compressed lengths must be one-dimensional")
-    if compressed_lengths.numel() != block_table.shape[0]:
-        raise ValueError("QSA compressed lengths must match the block table")
-
-    parts: list[torch.Tensor] = []
-    cu_lengths = [0]
-    for request_idx, length_value in enumerate(compressed_lengths.tolist()):
-        length = int(length_value)
-        if length < 0:
-            raise ValueError("QSA compressed lengths must be non-negative")
-        if length:
-            positions = torch.arange(length, device=block_table.device)
-            requests = torch.full_like(positions, request_idx)
-            rows = gather_qsa_cache_rows(
-                cache, block_table, requests, positions
-            ).unsqueeze(1)
-            parts.append(rows)
-        cu_lengths.append(cu_lengths[-1] + length)
-
-    packed = torch.cat(parts) if parts else cache.new_empty((0, 1, cache.shape[-1]))
-    cu = torch.tensor(cu_lengths, dtype=torch.int32, device=cache.device)
-    return packed, cu
-
-
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
 
@@ -175,51 +46,6 @@ def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     if positions.shape[0] == 1:
         positions = positions.expand(3, -1)
     return positions.transpose(0, 1).unsqueeze(1).to(torch.int64)
-
-
-def qsa_group_state(
-    raw_key_cache: torch.Tensor,
-    raw_key_metadata: QSAForwardMetadata,
-    boundary_rows: torch.Tensor,
-    compress_ratio: int,
-    rope_position_cache: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather raw-key groups and exact or derived first-token positions."""
-
-    if compress_ratio <= 0:
-        raise ValueError("QSA compression ratio must be positive")
-    boundary_rows = boundary_rows.to(
-        device=raw_key_metadata.logical_positions.device, dtype=torch.long
-    )
-    boundary_positions = raw_key_metadata.logical_positions.index_select(
-        0, boundary_rows
-    )
-    request_indices = raw_key_metadata.token_to_req.index_select(0, boundary_rows)
-    offsets = torch.arange(
-        compress_ratio - 1,
-        -1,
-        -1,
-        device=boundary_positions.device,
-        dtype=torch.long,
-    )
-    group_positions = boundary_positions[:, None] - offsets[None, :]
-    group_requests = request_indices[:, None].expand_as(group_positions)
-    key_groups = gather_qsa_cache_rows(
-        raw_key_cache,
-        raw_key_metadata.block_table,
-        group_requests,
-        group_positions,
-    ).unsqueeze(2)
-    if rope_position_cache is None:
-        first_positions = group_positions[:, :1].expand(-1, 3)
-    else:
-        first_positions = gather_qsa_cache_rows(
-            rope_position_cache,
-            raw_key_metadata.block_table,
-            request_indices,
-            group_positions[:, 0],
-        )
-    return key_groups, first_positions
 
 
 def _logical_positions(
@@ -245,6 +71,36 @@ def _logical_positions(
     )
 
 
+def _logical_to_physical_qsa_slots(
+    block_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    logical_positions: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    if block_size <= 0:
+        raise ValueError("QSA cache block size must be positive")
+    if block_table.ndim != 2:
+        raise ValueError("QSA block table must be two-dimensional")
+    if request_indices.shape != logical_positions.shape:
+        request_indices = torch.broadcast_to(request_indices, logical_positions.shape)
+
+    requests = request_indices.to(device=block_table.device, dtype=torch.long)
+    positions = logical_positions.to(device=block_table.device, dtype=torch.long)
+    valid = (requests >= 0) & (requests < block_table.shape[0]) & (positions >= 0)
+    logical_blocks = torch.div(
+        positions.clamp_min(0), block_size, rounding_mode="floor"
+    )
+    valid &= logical_blocks < block_table.shape[1]
+    safe_requests = requests.clamp(0, max(block_table.shape[0] - 1, 0))
+    safe_blocks = logical_blocks.clamp(0, max(block_table.shape[1] - 1, 0))
+    if not all(block_table.shape):
+        return torch.full_like(positions, -1)
+    physical_blocks = block_table[safe_requests, safe_blocks].long()
+    valid &= physical_blocks >= 0
+    slots = physical_blocks * block_size + positions.remainder(block_size)
+    return torch.where(valid, slots, torch.full_like(slots, -1))
+
+
 def compressed_qsa_slot_mapping(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
@@ -260,7 +116,7 @@ def compressed_qsa_slot_mapping(
     compressed_positions = torch.div(
         logical_positions.clamp_min(0), compress_ratio, rounding_mode="floor"
     )
-    slots = logical_to_physical_qsa_slots(
+    slots = _logical_to_physical_qsa_slots(
         block_table,
         token_to_req,
         compressed_positions,
@@ -526,9 +382,4 @@ __all__ = [
     "QSAStateBackend",
     "canonical_qsa_rope_positions",
     "compressed_qsa_slot_mapping",
-    "gather_packed_qsa_keys",
-    "gather_qsa_cache_rows",
-    "logical_to_physical_qsa_slots",
-    "qsa_group_state",
-    "store_qsa_cache_rows",
 ]

@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm.config.compilation import CompilationConfig
@@ -72,6 +73,59 @@ def test_qwen3_8_flash_next_qsa_enables_per_group_draft_metadata() -> None:
     )
 
     assert config.uses_per_group_attn_metadata
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"indexer_n_heads": 2}, "missing required fields"),
+        (
+            {
+                "indexer_n_heads": 0,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 8,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+            },
+            "must be positive",
+        ),
+        (
+            {
+                "indexer_n_heads": 2,
+                "indexer_kv_heads": 2,
+                "indexer_head_dim": 8,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+            },
+            "indexer_kv_heads=1",
+        ),
+        (
+            {
+                "indexer_n_heads": 2,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 8,
+                "indexer_budget": 1025,
+                "indexer_compress_ratio": 2,
+            },
+            "must be divisible",
+        ),
+        (
+            {
+                "indexer_n_heads": 2,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 8,
+                "indexer_budget": 1024,
+                "indexer_compress_ratio": 4,
+            },
+            "512 or 2048",
+        ),
+    ],
+)
+def test_qwen3_8_flash_next_rejects_invalid_qsa_config(
+    overrides: dict[str, int], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _text_config(**overrides)
 
 
 def test_qwen3_8_flash_next_qsa_is_split_from_piecewise_graphs() -> None:

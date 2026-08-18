@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NVIDIA QSA owner with Triton production kernels and a CPU oracle."""
+"""NVIDIA QSA owner with Triton kernels."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
-from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -50,14 +49,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from ..common.sparse_attention_qsa import (
-    QSAProductionKernelUnavailable,
-    QSAReferenceSparseAttention,
-)
 from . import model
 from .indexer_qsa import QSAIndexer
-
-_QSA_GATHER_BUDGET_BYTES = 128 * 1024 * 1024
 
 
 def qsa_token_to_request(
@@ -81,115 +74,6 @@ def qsa_token_to_request(
         padded_query_lens,
         output_size=num_tokens,
     )
-
-
-def qsa_query_positions(
-    query_start_loc: torch.Tensor,
-    token_to_req: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-) -> torch.Tensor:
-    """Return request-relative logical position for every packed query row."""
-
-    rows = token_to_req.numel()
-    requests = token_to_req.to(device=query_start_loc.device, dtype=torch.long)
-    query_lens = torch.diff(query_start_loc).long()
-    row_ids = torch.arange(rows, dtype=torch.long, device=query_start_loc.device)
-    within_query = row_ids - query_start_loc.index_select(0, requests).long()
-    logical_positions = (
-        sequence_lengths.to(query_start_loc.device).index_select(0, requests).long()
-        - query_lens.index_select(0, requests)
-        + within_query
-    )
-    return torch.where(row_ids < query_start_loc[-1], logical_positions, -1)
-
-
-def gather_qsa_selected_kv(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    logical_indices: torch.Tensor,
-    block_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    query_positions: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather request-relative QSA selections from a paged main K/V cache.
-
-    Invalid entries must form a contiguous ``-1`` suffix. They are zero-filled
-    and excluded through the returned per-row valid counts.
-    """
-
-    if key_cache.ndim != 4 or value_cache.ndim != 4:
-        raise ValueError("QSA K/V caches must be [blocks, slots, heads, dim]")
-    if key_cache.shape != value_cache.shape:
-        raise ValueError("QSA key and value caches must have identical shapes")
-    if logical_indices.ndim != 2:
-        raise ValueError("QSA logical indices must be [tokens, width]")
-    rows, width = logical_indices.shape
-    if token_to_req.shape != (rows,):
-        raise ValueError("QSA token-to-request mapping must match query rows")
-    if block_table.ndim != 2:
-        raise ValueError("QSA block table must be two-dimensional")
-    if sequence_lengths.ndim != 1:
-        raise ValueError("QSA sequence lengths must be one-dimensional")
-    if block_table.shape[0] != sequence_lengths.numel():
-        raise ValueError("QSA block table and sequence lengths must agree")
-    if query_positions is not None and query_positions.shape != (rows,):
-        raise ValueError("QSA query positions must match query rows")
-
-    device = key_cache.device
-    logical = logical_indices.to(device=device, dtype=torch.long)
-    requests = token_to_req.to(device=device, dtype=torch.long)
-    seq_lens = sequence_lengths.to(device=device, dtype=torch.long)
-    table = block_table.to(device=device)
-    if requests.numel() and bool(
-        ((requests < 0) | (requests >= seq_lens.numel())).any().item()
-    ):
-        raise ValueError("QSA request mapping is out of range")
-
-    valid = logical >= 0
-    valid_counts = valid.sum(dim=1, dtype=torch.int32)
-    columns = torch.arange(width, device=device).unsqueeze(0)
-    if bool((valid != (columns < valid_counts.unsqueeze(1))).any().item()):
-        raise ValueError("QSA valid indices must precede the -1 padding suffix")
-
-    row_lengths = seq_lens.index_select(0, requests)
-    if bool((valid & (logical >= row_lengths.unsqueeze(1))).any().item()):
-        raise ValueError("QSA selected an index outside its request sequence")
-    if query_positions is not None:
-        row_positions = query_positions.to(device=device, dtype=torch.long)
-        if bool((valid & (logical > row_positions.unsqueeze(1))).any().item()):
-            raise ValueError("QSA selected a token after its query position")
-
-    selected_shape = (rows, width, key_cache.shape[2], key_cache.shape[3])
-    if not bool(valid.any().item()):
-        return (
-            key_cache.new_zeros(selected_shape),
-            value_cache.new_zeros(selected_shape),
-            valid_counts,
-        )
-    if block_table.shape[1] == 0 or key_cache.shape[0] == 0:
-        raise ValueError("QSA cannot gather from an empty paged cache")
-
-    block_size = key_cache.shape[1]
-    safe_logical = logical.clamp_min(0)
-    logical_blocks = torch.div(safe_logical, block_size, rounding_mode="floor")
-    if bool((valid & (logical_blocks >= table.shape[1])).any().item()):
-        raise ValueError("QSA selected an index outside its block table")
-    safe_blocks = logical_blocks.clamp_max(table.shape[1] - 1)
-    physical_blocks = table[requests.unsqueeze(1), safe_blocks].long()
-    if bool((valid & (physical_blocks < 0)).any().item()):
-        raise ValueError("QSA selected an unallocated cache block")
-    if bool((valid & (physical_blocks >= key_cache.shape[0])).any().item()):
-        raise ValueError("QSA selected a physical block outside its cache")
-
-    safe_physical = physical_blocks.clamp(0, key_cache.shape[0] - 1)
-    offsets = safe_logical.remainder(block_size)
-    selected_k = key_cache[safe_physical, offsets]
-    selected_v = value_cache[safe_physical, offsets]
-    mask = valid.unsqueeze(-1).unsqueeze(-1)
-    selected_k = torch.where(mask, selected_k, torch.zeros_like(selected_k))
-    selected_v = torch.where(mask, selected_v, torch.zeros_like(selected_v))
-    return selected_k, selected_v, valid_counts
 
 
 class Qwen3_8FlashNextQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -226,7 +110,7 @@ class Qwen3_8FlashNextQSAFlashAttentionBackend(FlashAttentionBackend):
 
 
 class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
-    """Run paged sparse GQA, with a gathered FlashAttention CPU oracle path."""
+    """Run paged sparse GQA with the QSA Triton kernel."""
 
     supports_dcp: bool = False
     supports_pcp: bool = False
@@ -284,69 +168,18 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
         if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen3.8-Flash-Next QSA requires BF16 Q/K/V")
 
-        if query.is_cuda:
-            from .ops.qsa import qsa_sparse_paged_attention
+        from .ops.qsa import qsa_sparse_paged_attention
 
-            qsa_sparse_paged_attention(
-                query[:num_tokens],
-                key_cache,
-                value_cache,
-                logical_indices,
-                attn_metadata.block_table,
-                token_to_req,
-                self.scale,
-                output[:num_tokens],
-            )
-            return output
-
-        query_positions = qsa_query_positions(
-            attn_metadata.query_start_loc,
+        qsa_sparse_paged_attention(
+            query[:num_tokens],
+            key_cache,
+            value_cache,
+            logical_indices,
+            attn_metadata.block_table,
             token_to_req,
-            attn_metadata.seq_lens,
+            self.scale,
+            output[:num_tokens],
         )
-
-        width = logical_indices.shape[1]
-        if width <= 0:
-            raise RuntimeError("QSA selection width must be positive")
-        bytes_per_row = (
-            width * self.num_kv_heads * self.head_size * key_cache.element_size() * 2
-        )
-        rows_per_chunk = max(1, _QSA_GATHER_BUDGET_BYTES // bytes_per_row)
-        fa_version = self.vllm_flash_attn_version
-        if fa_version is None:
-            raise RuntimeError("QSA could not resolve a FlashAttention version")
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-
-        for row_start in range(0, num_tokens, rows_per_chunk):
-            row_end = min(row_start + rows_per_chunk, num_tokens)
-            selected_k, selected_v, valid_counts = gather_qsa_selected_kv(
-                key_cache,
-                value_cache,
-                logical_indices[row_start:row_end],
-                attn_metadata.block_table,
-                token_to_req[row_start:row_end],
-                attn_metadata.seq_lens,
-                query_positions[row_start:row_end],
-            )
-            if bool((valid_counts <= 0).any().item()):
-                raise RuntimeError("QSA produced an empty selection for a query")
-            rows = row_end - row_start
-            cu_q = torch.arange(rows + 1, dtype=torch.int32, device=query.device)
-            cu_k = cu_q * width
-            flash_attn_varlen_func(
-                q=query[row_start:row_end],
-                k=selected_k.flatten(0, 1),
-                v=selected_v.flatten(0, 1),
-                out=output[row_start:row_end],
-                cu_seqlens_q=cu_q,
-                cu_seqlens_k=cu_k,
-                seqused_k=valid_counts,
-                max_seqlen_q=1,
-                max_seqlen_k=width,
-                softmax_scale=self.scale,
-                causal=False,
-                fa_version=fa_version,
-            )
         return output
 
 
@@ -653,25 +486,11 @@ direct_register_custom_op(
 )
 
 
-def require_qsa_cuda_kernel() -> None:
-    """Validate that the production QSA Triton path can run."""
-
-    if not current_platform.is_cuda() or not HAS_TRITON:
-        raise QSAProductionKernelUnavailable(
-            "Qwen3.8-Flash-Next QSA production kernels require CUDA and Triton"
-        )
-
-
 __all__ = [
     "QSAIndexer",
-    "QSAProductionKernelUnavailable",
-    "QSAReferenceSparseAttention",
     "Qwen3_8FlashNextQSAAttention",
     "Qwen3_8FlashNextQSAFlashAttentionBackend",
     "Qwen3_8FlashNextQSAFlashAttentionImpl",
-    "gather_qsa_selected_kv",
-    "qsa_query_positions",
     "qsa_token_to_request",
     "qwen3_8_flash_next_qsa_with_output",
-    "require_qsa_cuda_kernel",
 ]
