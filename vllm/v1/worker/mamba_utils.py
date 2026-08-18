@@ -820,7 +820,7 @@ class MambaSpecDecodeGPUContext:
         self,
         kv_cache_config: KVCacheConfig,
         forward_context: dict[str, Any],
-        mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+        mamba_state_copy_funcs: MambaStateCopyFuncsByType,
         block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
