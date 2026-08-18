@@ -5,7 +5,6 @@
 from typing import TYPE_CHECKING, Any
 
 from .common.hyperconnection import (
-    HYPERCONNECTION_CLASS_DICT,
     GatedResidualSimple,
     GroupedGemmaRMSNorm,
     HyperConnectionBase,
@@ -55,7 +54,6 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "GatedResidualSimple",
     "GroupedGemmaRMSNorm",
-    "HYPERCONNECTION_CLASS_DICT",
     "HyperConnectionBase",
     "HyperConnectionConfig",
     "Qwen3_8FlashNextForCausalLM",

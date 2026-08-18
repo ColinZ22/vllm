@@ -26,20 +26,18 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.uses_ngram_embedding = bool(
-            getattr(config, "use_ple", False)
-            and getattr(config, "ple_layer_ids", ())
-            and getattr(config, "ple_embedding_backend", None) == "ngram"
-        )
+        self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
+            self.ngram_context_len = 0
+            self.ngram_eos_token_id = 0
             return
 
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise RuntimeError(
                 "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1. With PP>1, ngram context is only "
-                "injected on the first rank and can become incorrect on "
-                "non-first ranks. Please run with PP=1."
+                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+                "not receive the raw input_ids required by PLE. Please run "
+                "with PP=1."
             )
 
         self.ngram_context_len = int(config.ngram_size) - 1

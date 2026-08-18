@@ -260,7 +260,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=bool(getattr(config, "qkv_bias", False)),
+            bias=False,
             quant_config=model.without_modelopt_fp4(quant_config),
             prefix=f"{prefix}.qkv_proj",
         )

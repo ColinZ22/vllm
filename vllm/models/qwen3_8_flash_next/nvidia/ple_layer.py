@@ -3,10 +3,8 @@
 """GPU-resident Qwen3.8-Flash-Next position-learning enhancement layers."""
 
 import math
-import unicodedata
 from collections.abc import Iterable, Sequence
 
-import regex as re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,15 +18,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_8_flash_next import (
     Qwen3_8FlashNextTextConfig,
 )
@@ -131,9 +124,6 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 
 
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
-    _SPACE_SENTINEL = "\ue000"
-    _WHITESPACE_RE = re.compile(r"[ \t\r\n]+")
-
     def __init__(
         self,
         config: Qwen3_8FlashNextTextConfig,
@@ -141,12 +131,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         ple_dense_layer_id: int,
         max_total_tokens: int,
         max_num_reqs: int,
-        model_config: ModelConfig,
         prefix: str,
     ) -> None:
         super().__init__()
-        self.config = config
-        self.model_config = model_config
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -161,27 +148,15 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 f"{embedding_dim} % {self.ngram_heads} != 0"
             )
         self.head_dim = embedding_dim // self.ngram_heads
-        self.eos_token_id_raw = int(config.eos_token_id)
-        self.eos_token_id = self.eos_token_id_raw
+        self.eos_token_id = int(config.eos_token_id)
         self.unigram_vocab_size = int(config.vocab_size)
-        self.use_compressed_mapping = bool(
-            getattr(config, "use_compressed_mapping", False)
-        )
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         if self.split_ngram_parts <= 0:
             raise ValueError("split_ngram_parts must be positive")
-        self.token_lookup: torch.Tensor | None
-        self.register_buffer(
-            "token_lookup",
-            torch.arange(self.unigram_vocab_size, dtype=torch.long)
-            if self.use_compressed_mapping
-            else None,
-            persistent=self.use_compressed_mapping,
-        )
 
         max_multiplier = ((1 << 63) - 1) // self.unigram_vocab_size
         half_bound = max(1, max_multiplier // 2)
-        seed = int(getattr(config, "seed", 0))
+        seed = int(getattr(config, "seed", 1234))
         base_seed = seed + _PLE_LAYER_PRIME * ple_dense_layer_id
         multipliers = []
         for index in range(self.ngram_size):
@@ -193,34 +168,13 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             persistent=True,
         )
 
-        raw_weights = getattr(config, "oe_ngram_m_weights", None)
-        if raw_weights in (None, ""):
-            ngram_weights = [1.0] * (self.ngram_size - 1)
-        elif isinstance(raw_weights, str):
-            ngram_weights = [
-                float(item.strip()) for item in raw_weights.split(",") if item.strip()
-            ]
-        else:
-            assert raw_weights is not None
-            ngram_weights = [float(item) for item in raw_weights]
-        if len(ngram_weights) != self.ngram_size - 1:
-            raise ValueError(
-                f"oe_ngram_m_weights must have {self.ngram_size - 1} values"
-            )
-
-        total_budget = self.ngram_heads * int(config.ngram_vocab_size_base)
-        weighted_sum = sum(
-            ngram_weights[index // self.heads_per_ngram]
-            for index in range(self.ngram_heads)
-        )
+        ngram_vocab_size_base = int(config.ngram_vocab_size_base)
         sizes: list[int] = []
         offsets: list[int] = []
         offset = 0
         for local_head in range(self.ngram_heads):
-            ngram_level = local_head // self.heads_per_ngram
-            base = int(total_budget * ngram_weights[ngram_level] / weighted_sum)
             global_head = ple_dense_layer_id * self.ngram_heads + local_head
-            size = _nth_prime_after(base - 1, global_head + 1)
+            size = _nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)
             sizes.append(size)
             offsets.append(offset)
             offset += size
@@ -236,16 +190,12 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
-        dtype_name = getattr(config, "ple_embed_dtype", None)
-        params_dtype = getattr(torch, dtype_name) if dtype_name else None
         self.ngram_embedding = VocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
-            params_dtype=params_dtype,
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
         )
-        context_len = self.ngram_size - 1
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -255,90 +205,11 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             "padded_buffer",
             torch.full(
                 (max_num_reqs, max_total_tokens),
-                self.eos_token_id_raw,
-                dtype=torch.int64,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "ngram_context_buffer",
-            torch.full(
-                (max_num_reqs, context_len),
                 self.eos_token_id,
                 dtype=torch.int64,
             ),
             persistent=False,
         )
-
-    @staticmethod
-    def _normalize_text_for_compression(text: str, normalize_whitespace: bool) -> str:
-        text = unicodedata.normalize("NFKC", text)
-        text = unicodedata.normalize("NFD", text)
-        text = "".join(ch for ch in text if not unicodedata.combining(ch))
-        text = text.lower()
-        if normalize_whitespace:
-            text = Qwen3_8FlashNextNGramEmbedding._WHITESPACE_RE.sub(" ", text)
-            if text == " ":
-                text = Qwen3_8FlashNextNGramEmbedding._SPACE_SENTINEL
-            text = text.strip()
-            if text == Qwen3_8FlashNextNGramEmbedding._SPACE_SENTINEL:
-                text = " "
-        return text
-
-    def _build_compressed_mapping(self) -> None:
-        tokenizer = cached_tokenizer_from_config(self.model_config)
-        if tokenizer is None:
-            raise RuntimeError(
-                "Compressed ngram PLE requires token_lookup in the checkpoint "
-                "when tokenizer initialization is disabled"
-            )
-        vocab_size = len(tokenizer)
-        if self.unigram_vocab_size < vocab_size:
-            raise RuntimeError(
-                f"vocab_size ({self.unigram_vocab_size}) must be at least "
-                f"the tokenizer vocabulary size ({vocab_size})"
-            )
-        actual_vocab_size = self.eos_token_id_raw
-        if not 0 < actual_vocab_size <= vocab_size:
-            raise RuntimeError(
-                "Invalid eos_token_id for compressed mapping: "
-                f"{actual_vocab_size} with tokenizer vocabulary {vocab_size}"
-            )
-
-        normalize_whitespace = bool(
-            getattr(self.config, "oe_normalize_whitespace", False)
-        )
-        lookup = list(range(self.unigram_vocab_size))
-        compressed_ids: dict[str, int] = {}
-        for token_id in range(actual_vocab_size):
-            text = tokenizer.decode([token_id], skip_special_tokens=False)
-            if "\ufffd" in text:
-                key = f"\x00byte:{token_id}"
-            else:
-                normalized = self._normalize_text_for_compression(
-                    text, normalize_whitespace
-                )
-                key = normalized or text
-            compressed_id = compressed_ids.setdefault(key, len(compressed_ids))
-            lookup[token_id] = compressed_id
-        device = (
-            self.token_lookup.device
-            if self.token_lookup is not None
-            else torch.device("cpu")
-        )
-        self.token_lookup = torch.tensor(lookup, dtype=torch.long, device=device)
-
-    def finalize_token_lookup(
-        self,
-        loaded_from_checkpoint: bool,
-    ) -> None:
-        if not self.use_compressed_mapping:
-            return
-        if not loaded_from_checkpoint:
-            self._build_compressed_mapping()
-        if self.token_lookup is None:
-            raise RuntimeError("Compressed ngram PLE token_lookup is missing")
-        self.eos_token_id = int(self.token_lookup[self.eos_token_id_raw].item())
 
     @staticmethod
     def _shift_precompute(
@@ -379,7 +250,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
-        ngram_context: torch.Tensor | None,
+        ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
@@ -398,24 +269,16 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
 
         positions = self.positions_buffer[:num_tokens]
         packed = self.padded_buffer[:num_reqs]
-        packed.fill_(self.eos_token_id_raw)
+        packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
         packed[request_indices, columns] = input_ids
-        if ngram_context is None:
-            ngram_context = self.ngram_context_buffer[:num_reqs]
-        else:
-            ngram_context = ngram_context[:num_reqs].to(
-                device=input_ids.device, dtype=torch.long
-            )
-
-        if self.use_compressed_mapping:
-            assert self.token_lookup is not None
-            packed = self.token_lookup[packed]
-            ngram_context = self.token_lookup[ngram_context]
+        ngram_context = ngram_context[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
 
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
@@ -463,7 +326,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
-            if leaf_name.startswith("hashstats_"):
+            if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]
@@ -541,53 +404,21 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         )
         self.prefix = prefix
         self.hidden_size = int(config.hidden_size)
-        self.hc_count = int(config.hc_count) if config.use_hc else 1
+        self.hc_count = config.hc_count
         self.hc_hidden_size = self.hidden_size * self.hc_count
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
-        self.short_conv_dilation = (
-            int(config.ngram_size) if config.ple_embedding_backend == "ngram" else 1
-        )
+        self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding_backend = config.ple_embedding_backend
-        if config.ple_norm_affine_per_branch and not config.use_hc:
-            raise ValueError("ple_norm_affine_per_branch=True requires use_hc=True")
-        self.ple_embed_quant_scale = float(
-            getattr(config, "ple_embed_quant_scale", 1.0)
+        self.ple_embedding: nn.Module = Qwen3_8FlashNextNGramEmbedding(
+            config,
+            int(config.ple_embed_dim),
+            self.ple_dense_layer_id,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_seqs,
+            f"{prefix}.ple_embedding",
         )
-        if (
-            not math.isfinite(self.ple_embed_quant_scale)
-            or self.ple_embed_quant_scale <= 0
-        ):
-            raise ValueError(
-                "ple_embed_quant_scale must be a finite positive scalar, "
-                f"got {self.ple_embed_quant_scale}"
-            )
-        if self.ple_embed_quant_scale != 1.0:
-            dtype_name = getattr(config, "ple_embed_dtype", None)
-            ple_embed_dtype = getattr(torch, dtype_name) if dtype_name else None
-            if ple_embed_dtype in (None, model_config.dtype):
-                raise ValueError(
-                    "Scaled PLE embeddings require ple_embed_dtype to differ "
-                    "from the model dtype"
-                )
-        if self.ple_embedding_backend == "ngram":
-            self.ple_embedding: nn.Module = Qwen3_8FlashNextNGramEmbedding(
-                config,
-                int(config.ple_embed_dim),
-                self.ple_dense_layer_id,
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.scheduler_config.max_num_seqs,
-                model_config,
-                f"{prefix}.ple_embedding",
-            )
-        else:
-            self.ple_embedding = VocabParallelEmbedding(
-                config.vocab_size,
-                int(config.ple_embed_dim),
-                prefix=f"{prefix}.ple_embedding",
-            )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -602,10 +433,12 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             quant_config=quant_config,
             prefix=f"{prefix}.value_proj",
         )
-        branch_affine = bool(config.ple_norm_affine_per_branch and config.use_hc)
-        norm_size = self.hc_hidden_size if branch_affine else self.hidden_size
-        group_size = self.hidden_size if branch_affine else None
-        norm_args = (norm_size, config.rms_norm_eps, group_size, model_config.dtype)
+        norm_args = (
+            self.hc_hidden_size,
+            config.rms_norm_eps,
+            self.hidden_size,
+            model_config.dtype,
+        )
         self.norm_key = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
         self.norm_query = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
         self.norm_conv = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
@@ -650,8 +483,6 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
     def _apply_norm(
         self, norm: Qwen3_8FlashNextPLEGroupedNorm, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        if norm.weight.shape[0] == hidden_states.shape[-1]:
-            return norm(hidden_states)
         shape = hidden_states.shape
         return norm(hidden_states.flatten(-2)).reshape(shape)
 
@@ -1140,169 +971,28 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             conv_state = conv_state.transpose(-1, -2)
         conv_weights = self.conv1d.weight.squeeze(1)
 
-        if self.short_conv_dilation != 1:
-            state_capacity = self.conv_state_len + self.num_spec_tokens
-            if state_capacity > 0:
-                if conv_state.size(-1) < state_capacity:
-                    raise RuntimeError(
-                        "PLE short-conv cache is smaller than expected for "
-                        f"dilated convolution: got {conv_state.size(-1)}, "
-                        f"expect at least {state_capacity}."
-                    )
-                conv_state = conv_state[..., -state_capacity:]
-            return self._short_conv_dilated_dispatch(
-                inputs,
-                layer_attn_metadata,
-                conv_state,
-                conv_weights.to(dtype=inputs.dtype),
-            )
-
-        return self._short_conv_spec_dispatch(
+        state_capacity = self.conv_state_len + self.num_spec_tokens
+        if state_capacity > 0:
+            if conv_state.size(-1) < state_capacity:
+                raise RuntimeError(
+                    "PLE short-conv cache is smaller than expected for "
+                    f"dilated convolution: got {conv_state.size(-1)}, "
+                    f"expect at least {state_capacity}."
+                )
+            conv_state = conv_state[..., -state_capacity:]
+        return self._short_conv_dilated_dispatch(
             inputs,
             layer_attn_metadata,
             conv_state,
-            conv_weights,
+            conv_weights.to(dtype=inputs.dtype),
         )
-
-    def _short_conv_spec_dispatch(
-        self,
-        x: torch.Tensor,
-        attn_metadata: PleShortConvAttentionMetadata,
-        conv_state: torch.Tensor,
-        conv_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        """Non-dilated (dilation == 1) short-conv dispatch supporting MTP /
-        speculative decoding via the sliding-window causal_conv1d_update."""
-        num_prefills = attn_metadata.num_prefills
-        num_decodes = attn_metadata.num_decodes
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        num_prefill_tokens = attn_metadata.num_prefill_tokens
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        has_prefill = num_prefills > 0
-        has_decode = num_decodes > 0
-
-        spec_sequence_masks = attn_metadata.spec_sequence_masks
-        has_spec = spec_sequence_masks is not None
-
-        x = x[:num_actual_tokens]
-
-        # Split spec / non-spec tokens.
-        if has_spec:
-            if not has_prefill and not has_decode:
-                x_spec = x
-                x_non_spec = None
-            else:
-                assert attn_metadata.spec_token_indx is not None
-                assert attn_metadata.non_spec_token_indx is not None
-                x_spec = x.index_select(0, attn_metadata.spec_token_indx)
-                x_non_spec = x.index_select(0, attn_metadata.non_spec_token_indx)
-        else:
-            x_spec = None
-            x_non_spec = x
-
-        # 1. Speculative-decode (multi-query) part.
-        conv_out_spec = None
-        if has_spec:
-            assert x_spec is not None
-            assert attn_metadata.spec_state_indices_tensor is not None
-            assert attn_metadata.num_accepted_tokens is not None
-            assert attn_metadata.spec_query_start_loc is not None
-            conv_out_spec = causal_conv1d_update(
-                x_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_state_indices=attn_metadata.spec_state_indices_tensor[
-                    : attn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=attn_metadata.num_accepted_tokens,
-                query_start_loc=attn_metadata.spec_query_start_loc,
-                max_query_len=attn_metadata.spec_query_len,
-                validate_data=False,
-            )
-
-        # 2. Non-spec part: regular decode and/or prefill.
-        state_indices_tensor = attn_metadata.state_indices_tensor
-        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-
-        conv_out_non_spec = None
-        if x_non_spec is not None:
-            assert state_indices_tensor is not None
-            if has_prefill:
-                state_indices_tensor_d, state_indices_tensor_p = torch.split(
-                    state_indices_tensor,
-                    [num_decodes, num_prefills],
-                    dim=0,
-                )
-                x_d, x_p = torch.split(
-                    x_non_spec,
-                    [num_decode_tokens, num_prefill_tokens],
-                    dim=0,
-                )
-                non_spec_parts: list[torch.Tensor] = []
-                if has_decode:
-                    non_spec_parts.append(
-                        causal_conv1d_update(
-                            x_d,
-                            conv_state,
-                            conv_weights,
-                            self.conv1d.bias,
-                            activation=self.activation,
-                            conv_state_indices=state_indices_tensor_d,
-                        )
-                    )
-                assert non_spec_query_start_loc is not None
-                assert attn_metadata.has_initial_states_p is not None
-                query_start_loc_p = (
-                    non_spec_query_start_loc[num_decodes:] - num_decode_tokens
-                )
-                non_spec_parts.append(
-                    causal_conv1d_fn(
-                        x_p.transpose(0, 1),
-                        conv_weights,
-                        self.conv1d.bias,
-                        conv_states=conv_state,
-                        cache_indices=state_indices_tensor_p,
-                        has_initial_state=attn_metadata.has_initial_states_p,
-                        query_start_loc=query_start_loc_p,
-                        activation=self.activation,
-                        metadata=attn_metadata,
-                    ).transpose(0, 1)[:num_prefill_tokens]
-                )
-                conv_out_non_spec = torch.vstack(non_spec_parts)
-            else:
-                conv_out_non_spec = causal_conv1d_update(
-                    x_non_spec,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    activation=self.activation,
-                    conv_state_indices=state_indices_tensor[: x_non_spec.size(0)],
-                )
-
-        # 3. Merge conv outputs back into the original token order.
-        if has_spec and conv_out_non_spec is not None:
-            assert conv_out_spec is not None
-            assert attn_metadata.spec_token_indx is not None
-            assert attn_metadata.non_spec_token_indx is not None
-            out = x.new_empty((num_actual_tokens, x.size(-1)))
-            out.index_copy_(0, attn_metadata.spec_token_indx, conv_out_spec)
-            out.index_copy_(0, attn_metadata.non_spec_token_indx, conv_out_non_spec)
-            return out
-        elif has_spec:
-            assert conv_out_spec is not None
-            return conv_out_spec
-        if conv_out_non_spec is None:
-            return x
-        return conv_out_non_spec
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
-        query_start_loc: torch.Tensor | None,
-        ngram_context: torch.Tensor | None,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
         if input_ids.shape[0] != hidden_states.shape[0]:
@@ -1311,14 +1001,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        if self.ple_embedding_backend == "ngram":
-            if query_start_loc is None:
-                raise ValueError("ngram PLE requires query_start_loc")
-            embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
-        else:
-            embeddings = self.ple_embedding(input_ids)
-        embeddings = embeddings.to(hidden_states.dtype)
-        embeddings = embeddings * self.ple_embed_quant_scale
+        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]

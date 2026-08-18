@@ -571,13 +571,8 @@ class GPUModelRunner(
         self.use_alibi = model_config.uses_alibi
 
         # PLE
-        self.use_ple = bool(getattr(model_config.hf_text_config, "use_ple", False))
-        self.ple_embedding_backend = getattr(
-            model_config.hf_text_config, "ple_embedding_backend", None
-        )
-        self.uses_ngram_embedding = (
-            self.use_ple and self.ple_embedding_backend == "ngram"
-        )
+        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
+        self.uses_ngram_embedding = bool(ple_layer_ids)
         if self.uses_ngram_embedding:
             self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
             self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)

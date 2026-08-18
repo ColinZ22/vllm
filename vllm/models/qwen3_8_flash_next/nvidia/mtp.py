@@ -4,8 +4,7 @@
 
 The MTP draft model reuses the Qwen3.8-Flash-Next backbone (PLE/HC/MoE) but:
   - drops all multi-modal handling (text-only),
-  - forces PLE off and a plain HC role on its decoder layer(s) so the HC
-    stream count stays identical to the main model (hc_count, no +1),
+  - forces PLE off while keeping the main model's HC stream count,
   - fuses the backbone hidden and the new-token embedding via
     ``residual_linear_shared`` (fc_embedding + shared fc_hidden) instead of
     the ``Linear(2H, H)`` + repeat used by other MTP variants,
@@ -23,6 +22,7 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -53,7 +53,6 @@ from ..common.hyperconnection import (
 from .model import (
     _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES,
     Qwen3_8FlashNextDecoderLayer,
-    Qwen3_8FlashNextRMSNorm,
     Qwen3_8FlashNextSparseMoeBlock,
 )
 
@@ -170,21 +169,7 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
         self.hidden_size = config.hidden_size
-        self.use_hc = bool(getattr(config, "use_hc", False))
-        self.hc_count = int(getattr(config, "hc_count", 1))
-        self.hc_per_branch_norm = bool(getattr(config, "hc_per_branch_norm", False))
-        self.hc_final_method = getattr(
-            config, "hc_final_method", "hyperconnection_average"
-        )
-        self.hc_has_final_norm = (
-            self.use_hc and self.hc_final_method != "hyperconnection_average"
-        )
-        # Whether the MTP forward emits two streams (single [T,H] + multi
-        # [T, hc_count*H]). Derived purely from config so it stays consistent
-        # with the eagle / runner switches and across P/D nodes.
-        self.mtp_hc_multi_stream = (
-            self.use_hc and bool(getattr(config, "mtp_hc", False)) and self.hc_count > 1
-        )
+        self.hc_count = config.hc_count
 
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
         draft_vllm_config = _make_draft_vllm_config(
@@ -219,66 +204,32 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
                     draft_vllm_config,
                     layer_type="full_attention",
                     force_disable_ple=True,
-                    force_plain_hc_role=True,
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
                 )
                 for idx in range(self.num_mtp_layers)
             )
 
-        # Three RMSNorms. pre_fc_norm_hidden size follows hc_per_branch_norm:
-        # joint norm over [H * hc_count] when per-branch norm is enabled,
-        # otherwise a plain per-branch RMSNorm(H).
-        def _make_norm(dim: int) -> Qwen3_8FlashNextRMSNorm:
-            # NOTE: MTP's pre_fc_norm in Megatron uses GroupedRMSNorm (no
-            # gated layernorm), even when config.gated_layernorm=True. The
-            # gated_layernorm config only applies to the main model's decoder
-            # layer input_layernorm.
-            return Qwen3_8FlashNextRMSNorm(
-                dim,
-                eps=config.rms_norm_eps,
-                pre_affine=getattr(config, "pre_affine", False),
-                gated_layernorm=False,
-                gated_layernorm_lowrank=getattr(config, "gated_layernorm_lowrank", 16),
-                use_gemma_rms_norm=getattr(config, "use_gemma_rms_norm", True),
-            )
-
-        self.pre_fc_norm_embedding = _make_norm(self.hidden_size)
-        if self.use_hc and self.hc_per_branch_norm:
-            self.pre_fc_norm_hidden = _make_norm(self.hidden_size * self.hc_count)
-        else:
-            self.pre_fc_norm_hidden = _make_norm(self.hidden_size)
-        # HC final mixer (collapses the multi stream into [T, H] for the LM
-        # head). Built only when hc_has_final_norm; otherwise we fall back to
-        # the mean + norm collapse.
-        if self.hc_has_final_norm:
-            self.norm = PPMissingLayer()
-            self.hyper_connection_mixer = self._build_final_mixer(config)
-        else:
-            self.norm = _make_norm(self.hidden_size)
-            self.hyper_connection_mixer = None
-
-        intermediate_size = (
-            self.hidden_size * self.hc_count if self.use_hc else self.hidden_size
+        self.pre_fc_norm_embedding = GemmaRMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps
         )
-        intermediate_keys = (
-            ["hidden_states"] if self.use_hc else ["hidden_states", "residual"]
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
+            self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
+        # HC final mixer collapses the multi stream into [T, H] for the LM head.
+        self.hyper_connection_mixer = self._build_final_mixer(config)
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            intermediate_keys, intermediate_size
+            ["hidden_states"], self.hidden_size * self.hc_count
         )
 
     def _build_final_mixer(self, config: Qwen3_8FlashNextTextConfig):
-        if self.hc_final_method != "gated_residual_simple":
-            raise ValueError(f"Unsupported hc_final_method {self.hc_final_method!r}")
         hc_config = HyperConnectionConfig(
-            hc_count=getattr(config, "hc_count", 4),
+            hc_count=config.hc_count,
             hidden_size=config.hidden_size,
             params_dtype=torch.bfloat16,
-            init_method_std=0.02,
-            mtp_hc=getattr(config, "mtp_hc", False),
-            hc_lowrank=getattr(config, "hc_lowrank", 128),
+            hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
-            hc_per_branch_norm=getattr(config, "hc_per_branch_norm", False),
+            hc_per_branch_norm=True,
         )
         # role="final" (NOT "mtp_*") keeps hc_count identical to the main
         # model; use_combine=False matches the main model's final mixer.
@@ -302,7 +253,6 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
-        use_hc = self.use_hc
         hc_count = self.hc_count
         H = self.hidden_size
 
@@ -315,33 +265,25 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
             inputs_embeds = self.fc_embedding(inputs_embeds)
 
-            if use_hc:
-                # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-                # the main model truly emits the pre-final-mixer multi stream
-                # on the first step; subsequent steps reuse the prior draft
-                # step's multi stream).
-                T = hidden_states.shape[0]
-                hidden_states = hidden_states.view(T, hc_count, H)
-                if self.hc_per_branch_norm:
-                    hidden_states = self.pre_fc_norm_hidden(
-                        hidden_states.flatten(-2)
-                    ).view(T, hc_count, H)
-                else:
-                    hidden_states = self.pre_fc_norm_hidden(hidden_states)
-                hidden_states = self.fc_hidden(hidden_states)
-                # Add the embedding residual to every branch, then fold back
-                # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-                hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-                hidden_states = hidden_states.flatten(-2)
-            else:
-                hidden_states = self.pre_fc_norm_hidden(hidden_states)
-                hidden_states = self.fc_hidden(hidden_states)
-                hidden_states = inputs_embeds + hidden_states
+            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+            # the main model truly emits the pre-final-mixer multi stream
+            # on the first step; subsequent steps reuse the prior draft
+            # step's multi stream).
+            T = hidden_states.shape[0]
+            hidden_states = hidden_states.view(T, hc_count, H)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                T, hc_count, H
+            )
+            hidden_states = self.fc_hidden(hidden_states)
+            # Add the embedding residual to every branch, then fold back
+            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            hidden_states = hidden_states.flatten(-2)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None if use_hc else intermediate_tensors["residual"]
+            residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -354,30 +296,15 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             ngram_context=ngram_context,
         )
         if not get_pp_group().is_last_rank:
-            output = {"hidden_states": hidden_states}
-            if not use_hc:
-                output["residual"] = residual
-            return IntermediateTensors(output)
+            return IntermediateTensors({"hidden_states": hidden_states})
 
-        if use_hc:
-            # Last PP rank finalize. Keep both:
-            #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
-            #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
-            #       for the next draft step (zero extra compute, just kept).
-            multi_hidden = hidden_states
-            if self.hyper_connection_mixer is not None:
-                sample_hidden_states, _ = self.hyper_connection_mixer.mix(multi_hidden)
-            else:
-                tmp = multi_hidden.view(
-                    *multi_hidden.shape[:-1], self.hc_count, self.hidden_size
-                ).mean(dim=-2)
-                sample_hidden_states = self.norm(tmp)
-            if self.mtp_hc_multi_stream:
-                return sample_hidden_states, multi_hidden
-            return sample_hidden_states
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        # Last PP rank finalize. Keep both:
+        #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
+        #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
+        #       for the next draft step (zero extra compute, just kept).
+        multi_hidden = hidden_states
+        sample_hidden_states, _ = self.hyper_connection_mixer.mix(multi_hidden)
+        return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = maybe_fuse_shared_experts(
@@ -386,14 +313,9 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        skip_substrs = (
-            ["hyper_connection_mixer.block_inject_weight"]
-            if self.hc_has_final_norm
-            else []
-        )
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=skip_substrs,
+            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
@@ -500,12 +422,9 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
                 if remapped_name is not None:
                     yield remapped_name, weight
 
-        skip_substrs = []
-        if self.model.hc_has_final_norm:
-            skip_substrs.append("hyper_connection_mixer.block_inject_weight")
         loader = AutoWeightsLoader(
             self,
-            skip_substrs=skip_substrs,
+            skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(remap_weight_names())

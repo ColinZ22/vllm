@@ -29,6 +29,8 @@ Typical usage inside a transformer decoder layer::
     hidden_states = self.mlp_hc.combine(hidden_states, residual)
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -37,28 +39,17 @@ from torch import nn
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+@dataclass
 class HyperConnectionConfig:
     """Configuration shared by all HyperConnection variants."""
 
-    def __init__(
-        self,
-        hc_count: int = 4,
-        hidden_size: int = 64,
-        params_dtype: torch.dtype = torch.bfloat16,
-        init_method_std: float = 0.02,
-        mtp_hc: bool = False,
-        hc_lowrank: int = 16,
-        rms_norm_eps: float = 1e-6,
-        hc_per_branch_norm: bool = False,
-    ) -> None:
-        self.hc_count = hc_count
-        self.hidden_size = hidden_size
-        self.params_dtype = params_dtype
-        self.init_method_std = init_method_std
-        self.mtp_hc = mtp_hc
-        self.hc_lowrank = hc_lowrank
-        self.rms_norm_eps = rms_norm_eps
-        self.hc_per_branch_norm = hc_per_branch_norm
+    hc_count: int = 4
+    hidden_size: int = 64
+    params_dtype: torch.dtype = torch.bfloat16
+    mtp_hc: bool = False
+    hc_lowrank: int = 16
+    rms_norm_eps: float = 1e-6
+    hc_per_branch_norm: bool = False
 
 
 class GroupedGemmaRMSNorm(nn.Module):
@@ -171,8 +162,8 @@ class GatedResidualSimple(HyperConnectionBase):
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
         )
         group_size = config.hidden_size if config.hc_per_branch_norm else None
-        # Compare original impl, use Qwen3_8FlashNextRMSNorm instead of GemmaRMSNorm
-        # to hackily support the grouped norm in hc.
+        # Normalize each H-sized HC stream independently while retaining a
+        # separate affine weight for every element of the HC*H layout.
         self.hc_norm = GroupedGemmaRMSNorm(
             norm_size,
             eps=config.rms_norm_eps,
@@ -251,16 +242,9 @@ class GatedResidualSimple(HyperConnectionBase):
         return output.flatten(-2).to(hyper_input.dtype)
 
 
-HYPERCONNECTION_CLASS_DICT: dict[str, type[HyperConnectionBase]] = {
-    "hyperconnection_average": HyperConnectionBase,
-    "gated_residual_simple": GatedResidualSimple,
-}
-
-
 __all__ = [
     "GatedResidualSimple",
     "GroupedGemmaRMSNorm",
-    "HYPERCONNECTION_CLASS_DICT",
     "HyperConnectionBase",
     "HyperConnectionConfig",
 ]

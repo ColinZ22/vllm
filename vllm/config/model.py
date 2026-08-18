@@ -1456,10 +1456,6 @@ class ModelConfig:
         return hidden_size
 
     @property
-    def use_hc(self) -> bool:
-        return bool(getattr(self.hf_text_config, "use_hc", False))
-
-    @property
     def uses_per_group_attn_metadata(self) -> bool:
         return bool(
             getattr(

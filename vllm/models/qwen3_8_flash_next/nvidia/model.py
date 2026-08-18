@@ -6,7 +6,6 @@ from collections.abc import Iterable
 from itertools import islice
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -82,12 +81,11 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import (
-    HYPERCONNECTION_CLASS_DICT,
     GatedResidualSimple,
     HyperConnectionConfig,
 )
 from ..config import Qwen3_8FlashNextConfig
-from .ple_layer import Qwen3_8FlashNextNGramEmbedding, Qwen3_8FlashNextPLELayer
+from .ple_layer import Qwen3_8FlashNextPLELayer
 from .qsa import Qwen3_8FlashNextQSAAttention
 
 
@@ -150,89 +148,11 @@ _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Qwen3_8FlashNextRMSNorm: custom RMSNorm with optional gated_layernorm support
-# ---------------------------------------------------------------------------
-class Qwen3_8FlashNextRMSNorm(nn.Module):
-    """Qwen3.8-Flash-Next RMSNorm with its checkpoint-compatible optional gates."""
-
-    def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        pre_affine: bool = False,
-        gated_layernorm: bool = False,
-        gated_layernorm_lowrank: int = 16,
-        use_gemma_rms_norm: bool = True,
-        group_size: int | None = None,
-    ) -> None:
-        super().__init__()
-        if group_size is not None and dim % group_size:
-            raise ValueError(
-                f"dim ({dim}) must be divisible by group_size ({group_size})"
-            )
-        self.eps = eps
-        self.group_size = group_size
-        self.use_gemma_rms_norm = use_gemma_rms_norm
-        self.weight = nn.Parameter(torch.zeros(dim))
-        self.pre_affine = pre_affine
-        self.pre_weight = nn.Parameter(torch.ones(dim)) if pre_affine else None
-        self.gated_layernorm = gated_layernorm
-        if gated_layernorm:
-            self.gated_layernorm_downproj = nn.Linear(
-                dim, gated_layernorm_lowrank, bias=False
-            )
-            self.gated_layernorm_upproj = nn.Linear(
-                gated_layernorm_lowrank, dim, bias=False
-            )
-
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        if self.group_size is None:
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x_g = x.reshape(*x.shape[:-1], x.shape[-1] // self.group_size, self.group_size)
-        x_g = x_g * torch.rsqrt(x_g.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x_g.flatten(-2)
-
-    def _gate(self, x: torch.Tensor) -> torch.Tensor:
-        gate_score = F.silu(self.gated_layernorm_downproj(x))
-        gate_score = torch.sigmoid(self.gated_layernorm_upproj(gate_score))
-        return x * gate_score
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        if residual is not None:
-            x = x.float() + residual.float()
-            residual = x
-        if self.pre_weight is not None:
-            x = x * self.pre_weight.float()
-        output = self._norm(x.float())
-        if self.use_gemma_rms_norm:
-            output = output * (1.0 + self.weight.float())
-        else:
-            output = output * self.weight.float()
-        output = output.to(orig_dtype)
-        if self.gated_layernorm:
-            output = output.to(torch.bfloat16)
-            output = self._gate(output)
-        return output if residual is None else (output, residual)
-
-    def extra_repr(self) -> str:
-        return (
-            f"{tuple(self.weight.shape)}, eps={self.eps}, group_size={self.group_size}"
-        )
-
-
 class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen3.8-Flash-Next HC validation."""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
-        config = vllm_config.model_config.hf_text_config
-        use_hc = bool(getattr(config, "use_hc", False))
-        if use_hc and vllm_config.parallel_config.use_sequence_parallel_moe:
+        if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next HC does not support sequence-parallel MoE"
             )
@@ -249,7 +169,6 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
         layer_type: str,
         prefix: str = "",
         force_disable_ple: bool = False,
-        force_plain_hc_role: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
@@ -260,25 +179,13 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
-        # use_hc: HyperConnection initialization
-        self.use_hc = bool(getattr(config, "use_hc", False))
-        if self.use_hc and vllm_config.parallel_config.use_sequence_parallel_moe:
+        if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next HC does not support sequence-parallel MoE"
             )
-        # PLE declaration (guarded by use_ple + ple_layer_ids).
-        # When use_ple=False the decoder layer is bit-wise identical to the
-        # pre-PLE version: self.ple stays None and the forward path skips
-        # the PLE branch entirely.
         self.ple: Qwen3_8FlashNextPLELayer | None = None
-        use_ple = getattr(config, "use_ple", False)
-        ple_layer_ids = getattr(config, "ple_layer_ids", None) or []
-        if (
-            use_ple
-            and ple_layer_ids
-            and (self.layer_idx + 1) in ple_layer_ids
-            and not force_disable_ple
-        ):
+        ple_layer_ids = config.ple_layer_ids
+        if (self.layer_idx + 1) in ple_layer_ids and not force_disable_ple:
             ple_layer_ids_sorted = sorted(set(ple_layer_ids))
             ple_dense_layer_id_map = {
                 abs_id: idx for idx, abs_id in enumerate(ple_layer_ids_sorted)
@@ -298,7 +205,7 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=not self.use_hc,
+                reduce_results=False,
             )
         elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -308,7 +215,7 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
                     model_config=model_config,
                     cache_config=cache_config,
                     quant_config=quant_config,
-                    reduce_results=not self.use_hc,
+                    reduce_results=False,
                     prefix=f"{prefix}.self_attn",
                 )
             else:
@@ -317,7 +224,7 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
                     config=config,
                     layer_id=self.layer_idx,
                     quant_config=quant_config,
-                    reduce_results=not self.use_hc,
+                    reduce_results=False,
                     prefix=f"{prefix}.self_attn",
                 )
         else:
@@ -339,77 +246,28 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=not self.use_hc,
+                reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )
 
-        # gated_layernorm + use_hc: conditionally initialize HyperConnection
-        # modules instead of separate pre-attention layer norms.
-        if self.use_hc:
-            hc_method = getattr(config, "hc_method", "")
-            hc_class = HYPERCONNECTION_CLASS_DICT[hc_method]
-
-            # Identify MTP layers (layer_idx >= num_hidden_layers) purely so
-            # the role prefix picks up the extra MTP HC stream; layout is
-            # always HS-major (HC outer, HS inner).
-            is_mtp_layer = self.layer_idx >= config.num_hidden_layers
-            # MTP layers force a plain HC role (no "mtp_" prefix) so the HC
-            # stream count stays identical to the main model (hc_count, no +1).
-            if force_plain_hc_role:
-                is_mtp_layer = False
-            hc_config = HyperConnectionConfig(
-                hc_count=getattr(config, "hc_count", 4),
-                hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
-                init_method_std=0.02,
-                mtp_hc=getattr(config, "mtp_hc", False),
-                hc_lowrank=getattr(config, "hc_lowrank", 128),
-                rms_norm_eps=config.rms_norm_eps,
-                hc_per_branch_norm=getattr(config, "hc_per_branch_norm", False),
-            )
-            role_prefix = "mtp_" if is_mtp_layer else ""
-            self.attn_hyper_connection = hc_class(
-                hc_config,
-                layer_idx=self.layer_idx,
-                role=f"{role_prefix}attn",
-            )
-            self.mlp_hyper_connection = hc_class(
-                hc_config,
-                layer_idx=self.layer_idx,
-                role=f"{role_prefix}mlp",
-            )
-        else:
-            norm_kwargs = {
-                "eps": config.rms_norm_eps,
-                "pre_affine": getattr(config, "pre_affine", False),
-                "gated_layernorm": getattr(config, "gated_layernorm", False),
-                "gated_layernorm_lowrank": getattr(
-                    config, "gated_layernorm_lowrank", 16
-                ),
-                "use_gemma_rms_norm": getattr(config, "use_gemma_rms_norm", True),
-            }
-            self.input_layernorm = Qwen3_8FlashNextRMSNorm(
-                config.hidden_size, **norm_kwargs
-            )
-            self.post_attention_layernorm = Qwen3_8FlashNextRMSNorm(
-                config.hidden_size, **norm_kwargs
-            )
-
-        self.layer_scale = bool(getattr(config, "layer_scale", False))
-        if self.layer_scale:
-            self.attn_layer_scale = nn.Parameter(
-                torch.zeros(1, 1, config.hidden_size, dtype=model_config.dtype)
-            )
-            self.ffn_layer_scale = nn.Parameter(
-                torch.zeros(1, 1, config.hidden_size, dtype=model_config.dtype)
-            )
-
-    def _apply_layer_scale(
-        self, hidden_states: torch.Tensor, scale: torch.Tensor
-    ) -> torch.Tensor:
-        if hidden_states.ndim == 2:
-            return hidden_states * (scale.to(hidden_states.dtype)[0] + 1)
-        return hidden_states * (scale.to(hidden_states.dtype) + 1)
+        hc_config = HyperConnectionConfig(
+            hc_count=config.hc_count,
+            hidden_size=config.hidden_size,
+            params_dtype=torch.bfloat16,
+            hc_lowrank=config.hc_lowrank,
+            rms_norm_eps=config.rms_norm_eps,
+            hc_per_branch_norm=True,
+        )
+        self.attn_hyper_connection = GatedResidualSimple(
+            hc_config,
+            layer_idx=self.layer_idx,
+            role="attn",
+        )
+        self.mlp_hyper_connection = GatedResidualSimple(
+            hc_config,
+            layer_idx=self.layer_idx,
+            role="mlp",
+        )
 
     def forward(
         self,
@@ -422,92 +280,45 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del kwargs
-        # When use_hc=True, PLE is applied INSIDE the HC pipeline after the
-        # previous layer's combined output and before this layer's attention
-        # mix. use_ple=False layers are entirely unaffected.
-        if self.use_hc:
-            hc_method = getattr(self.config, "hc_method", "")
-            if "gated_residual" not in hc_method:
-                raise ValueError(
-                    "Only support forward Qwen3.8-Flash-Next decoder layer with "
-                    "hc_method set to gate_residual_simple, but got " + hc_method
-                )
-            if residual is not None:
-                raise ValueError("HC layers do not use a separate residual tensor")
-            if self.ple is not None:
-                if input_ids is None:
-                    raise ValueError("PLE requires input_ids")
-                hidden_states = hidden_states + self.ple(
-                    hidden_states,
-                    input_ids,
-                    query_start_loc,
-                    ngram_context,
-                )
-
-            mixed, hc_residual = self.attn_hyper_connection.mix(hidden_states)
-            if self.layer_type == "linear_attention":
-                self_attention_output = self.linear_attn(hidden_states=mixed)
-            elif self.layer_type == "full_attention":
-                self_attention_output = self.self_attn(
-                    hidden_states=mixed,
-                    positions=positions,
-                )
-            else:
-                raise ValueError("Invalid layer_type")
-            hidden_states = self_attention_output
-            if get_tensor_model_parallel_world_size() > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            if self.layer_scale:
-                hidden_states = self._apply_layer_scale(
-                    hidden_states, self.attn_layer_scale
-                )
-            hidden_states = self.attn_hyper_connection.combine(
-                hidden_states, hc_residual
+        if residual is not None:
+            raise ValueError("HC layers do not use a separate residual tensor")
+        if self.ple is not None:
+            if input_ids is None:
+                raise ValueError("PLE requires input_ids")
+            if query_start_loc is None:
+                raise ValueError("ngram PLE requires query_start_loc")
+            if ngram_context is None:
+                raise ValueError("ngram PLE requires ngram_context")
+            hidden_states = hidden_states + self.ple(
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
             )
 
-            mixed, hc_residual = self.mlp_hyper_connection.mix(hidden_states)
-            hidden_states = self.mlp(mixed)
-            if get_tensor_model_parallel_world_size() > 1 and getattr(
-                self.mlp, "requires_tp_all_reduce", True
-            ):
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            if self.layer_scale:
-                hidden_states = self._apply_layer_scale(
-                    hidden_states, self.ffn_layer_scale
-                )
-            hidden_states = self.mlp_hyper_connection.combine(
-                hidden_states, hc_residual
-            )
-            return hidden_states, None
-
-        # Non-hc path.
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
+        mixed, hc_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
-            self_attention_output = self.linear_attn(hidden_states=hidden_states)
+            self_attention_output = self.linear_attn(hidden_states=mixed)
         elif self.layer_type == "full_attention":
             self_attention_output = self.self_attn(
-                hidden_states=hidden_states,
+                hidden_states=mixed,
                 positions=positions,
             )
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.attn_hyper_connection.combine(hidden_states, hc_residual)
 
-        if self.layer_scale:
-            hidden_states = self._apply_layer_scale(
-                hidden_states, self.attn_layer_scale
-            )
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        if self.layer_scale:
-            hidden_states = self._apply_layer_scale(hidden_states, self.ffn_layer_scale)
-        return hidden_states, residual
+        mixed, hc_residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states = self.mlp(mixed)
+        if get_tensor_model_parallel_world_size() > 1 and getattr(
+            self.mlp, "requires_tp_all_reduce", True
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.mlp_hyper_connection.combine(hidden_states, hc_residual)
+        return hidden_states, None
 
 
 @support_torch_compile(
@@ -551,54 +362,26 @@ class Qwen3_8FlashNextModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.use_hc = bool(config.use_hc)
-        intermediate_size = (
-            config.hidden_size * config.hc_count if self.use_hc else config.hidden_size
-        )
-        intermediate_keys = (
-            ["hidden_states"] if self.use_hc else ["hidden_states", "residual"]
-        )
+        intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            intermediate_keys, intermediate_size
+            ["hidden_states"], intermediate_size
         )
 
-        self.hc_final_method = config.hc_final_method
-        self.hc_has_final_norm = self.use_hc and (
-            self.hc_final_method != "hyperconnection_average"
-        )
         self.hyper_connection_mixer: GatedResidualSimple | None
-        if get_pp_group().is_last_rank and self.hc_has_final_norm:
-            if self.hc_final_method != "gated_residual_simple":
-                raise ValueError(
-                    f"Unsupported hc_final_method {self.hc_final_method!r}"
-                )
+        if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
-                hc_count=getattr(config, "hc_count", 4),
+                hc_count=config.hc_count,
                 hidden_size=config.hidden_size,
                 params_dtype=torch.bfloat16,
-                init_method_std=0.02,
-                mtp_hc=getattr(config, "mtp_hc", False),
-                hc_lowrank=getattr(config, "hc_lowrank", 128),
+                hc_lowrank=config.hc_lowrank,
                 rms_norm_eps=config.rms_norm_eps,
-                hc_per_branch_norm=getattr(config, "hc_per_branch_norm", False),
+                hc_per_branch_norm=True,
             )
             self.hyper_connection_mixer = GatedResidualSimple(
                 hc_config, use_combine=False, role="final"
             )
-            self.norm = PPMissingLayer()
-        elif get_pp_group().is_last_rank:
-            self.hyper_connection_mixer = None
-            self.norm = Qwen3_8FlashNextRMSNorm(
-                config.hidden_size,
-                eps=config.rms_norm_eps,
-                pre_affine=getattr(config, "pre_affine", False),
-                gated_layernorm=getattr(config, "gated_layernorm", False),
-                gated_layernorm_lowrank=getattr(config, "gated_layernorm_lowrank", 16),
-                use_gemma_rms_norm=getattr(config, "use_gemma_rms_norm", True),
-            )
         else:
             self.hyper_connection_mixer = None
-            self.norm = PPMissingLayer()
 
         spec_config = vllm_config.speculative_config
         # MTP HC multi-stream outputs: when speculative method=="mtp" and the
@@ -607,10 +390,7 @@ class Qwen3_8FlashNextModel(nn.Module):
         # multi-stream backbone hidden on its first step (scheme A). Derived
         # purely from config (NOT node identity) so P/D nodes stay consistent.
         needs_mtp_hidden = (
-            self.use_hc
-            and bool(getattr(config, "mtp_hc", False))
-            and int(getattr(config, "hc_count", 1)) > 1
-            and spec_config is not None
+            spec_config is not None
             and getattr(spec_config, "method", None) == "mtp"
             and get_pp_group().is_last_rank
         )
@@ -644,14 +424,12 @@ class Qwen3_8FlashNextModel(nn.Module):
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
-            if self.use_hc:
-                # use_hc: expand hidden_states to [hc_count * hidden_size]
-                hidden_states = hidden_states.repeat(1, self.config.hc_count)
+            hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None if self.use_hc else intermediate_tensors["residual"]
+            residual = None
 
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
@@ -670,40 +448,28 @@ class Qwen3_8FlashNextModel(nn.Module):
                 deepstack_embed = deepstack_input_embeds[
                     f"deepstack_input_embeds_{layer_idx}"
                 ]
-                if self.use_hc:
-                    deepstack_embed = (
-                        deepstack_embed.unsqueeze(-2)
-                        .expand(
-                            *deepstack_embed.shape[:-1],
-                            self.config.hc_count,
-                            self.config.hidden_size,
-                        )
-                        .flatten(-2)
+                deepstack_embed = (
+                    deepstack_embed.unsqueeze(-2)
+                    .expand(
+                        *deepstack_embed.shape[:-1],
+                        self.config.hc_count,
+                        self.config.hidden_size,
                     )
+                    .flatten(-2)
+                )
                 hidden_states = hidden_states + deepstack_embed
 
         if not get_pp_group().is_last_rank:
-            output = {"hidden_states": hidden_states}
-            if not self.use_hc:
-                output["residual"] = residual
-            return IntermediateTensors(output)
+            return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self.use_hc:
-            if self._mtp_hidden_buffer is not None:
-                # Capture the pre-final-mixer multi-stream residual
-                # [T, hc_count*H] for the MTP drafter (zero extra compute:
-                # this tensor is needed by the final mixer regardless).
-                num_tokens = hidden_states.shape[0]
-                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states)
-            if self.hyper_connection_mixer is not None:
-                hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-            else:
-                hidden_states = hidden_states.unflatten(
-                    -1, (self.config.hc_count, self.config.hidden_size)
-                ).mean(dim=-2)
-                hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+        if self._mtp_hidden_buffer is not None:
+            # Capture the pre-final-mixer multi-stream residual
+            # [T, hc_count*H] for the MTP drafter (zero extra compute:
+            # this tensor is needed by the final mixer regardless).
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states)
+        assert self.hyper_connection_mixer is not None
+        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -722,9 +488,11 @@ class Qwen3_8FlashNextModel(nn.Module):
         )
         # Non-persistent PLE state rebuilt in __init__; skip any ckpt
         # column for them.
-        skip_substrs = ["hashstats_"]
-        if self.hc_has_final_norm:
-            skip_substrs.append("hyper_connection_mixer.block_inject_weight")
+        skip_substrs = [
+            "hashstats_",
+            "token_lookup",
+            "hyper_connection_mixer.block_inject_weight",
+        ]
         loader = AutoWeightsLoader(
             self,
             skip_substrs=skip_substrs,
@@ -734,11 +502,6 @@ class Qwen3_8FlashNextModel(nn.Module):
             weights,
             mapper=self.hf_to_vllm_mapper,
         )
-        for module_name, module in self.named_modules():
-            if not isinstance(module, Qwen3_8FlashNextNGramEmbedding):
-                continue
-            token_lookup_name = f"{module_name}.token_lookup"
-            module.finalize_token_lookup(token_lookup_name in loaded)
         return loaded
 
 
@@ -807,8 +570,6 @@ class Qwen3_8FlashNextForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen3_8FlashNextModel.
-        # When use_ple=False the runner doesn't inject them, kwargs is {},
-        # and behavior is bit-wise identical to the pre-PLE version.
         return self.model(
             input_ids,
             positions,
@@ -835,23 +596,19 @@ class Qwen3_8FlashNextForCausalLM(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, int]]:
         hf_config = vllm_config.model_config.hf_text_config
-        conv_kernel_size = getattr(hf_config, "ple_conv_kernel_size", 4)
-        ngram_size = getattr(hf_config, "ngram_size", 1)
-        ple_embedding_backend = getattr(hf_config, "ple_embedding_backend", "unigram")
-        short_conv_dilation = ngram_size if ple_embedding_backend == "ngram" else 1
+        conv_kernel_size = hf_config.ple_conv_kernel_size
+        short_conv_dilation = hf_config.ngram_size
         conv_state_len = (conv_kernel_size - 1) * short_conv_dilation
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config
             else 0
         )
-        use_hc = bool(getattr(hf_config, "use_hc", False))
-        hc_count = int(getattr(hf_config, "hc_count", 4)) if use_hc else 1
+        hc_count = hf_config.hc_count
         hc_hidden_size = hf_config.hidden_size * hc_count
-        conv_channels = hc_hidden_size if use_hc else hf_config.hidden_size
         return MambaStateShapeCalculator.short_conv_state_shape(
             tp_world_size=1,
-            intermediate_size=conv_channels,
+            intermediate_size=hc_hidden_size,
             conv_kernel=conv_state_len + 1,
             num_spec=num_spec,
         )
@@ -933,23 +690,18 @@ class Qwen3_8FlashNextForCausalLM(
         The PLE layer uses a separate short_conv MambaSpec whose page_size_bytes
         may exceed the GDN spec; callers should take the maximum.
         """
-        config = vllm_config.model_config.hf_text_config
-        specs = [
+        return (
             MambaSpec(
                 shapes=cls.get_gdn_mamba_state_shape_from_config(vllm_config),
                 dtypes=cls.get_gdn_mamba_state_dtype_from_config(vllm_config),
                 block_size=-1,
-            )
-        ]
-        if config.use_ple and config.ple_layer_ids:
-            specs.append(
-                MambaSpec(
-                    shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
-                    dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config),
-                    block_size=-1,
-                )
-            )
-        return tuple(specs)
+            ),
+            MambaSpec(
+                shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
+                dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config),
+                block_size=-1,
+            ),
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
@@ -1086,14 +838,14 @@ class Qwen3_8FlashNextForConditionalGeneration(
             with self._mark_tower_model(vllm_config, {"image", "video"}):
                 self.visual = Qwen3_VisionTransformer(
                     config.vision_config,
-                    norm_eps=getattr(config.text_config, "rms_norm_eps", 1e-6),
+                    norm_eps=config.text_config.rms_norm_eps,
                     quant_config=quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
 
         self.use_deepstack = (
             not self.language_model_only
-            and hasattr(config.vision_config, "deepstack_visual_indexes")
+            and bool(config.vision_config.deepstack_visual_indexes)
             and not isinstance(self.visual, StageMissingLayer)
         )
         self.deepstack_num_level = (
@@ -1258,6 +1010,5 @@ __all__ = [
     "Qwen3_8FlashNextForCausalLM",
     "Qwen3_8FlashNextForConditionalGeneration",
     "Qwen3_8FlashNextModel",
-    "Qwen3_8FlashNextRMSNorm",
     "Qwen3_8FlashNextSparseMoeBlock",
 ]

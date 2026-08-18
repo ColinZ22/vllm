@@ -51,15 +51,64 @@ def _text_config(**kwargs) -> Qwen3_8FlashNextTextConfig:
 def test_qwen3_8_flash_next_framework_defaults_enable_architecture_features() -> None:
     config = _text_config()
 
-    assert config.use_hc
-    assert config.hc_method == "gated_residual_simple"
-    assert config.hc_final_method == "gated_residual_simple"
-    assert config.hc_per_branch_norm
-    assert config.use_ple
-    assert config.ple_embedding_backend == "ngram"
-    assert config.ple_norm_affine_per_branch
+    assert config.hc_count == 2
     assert config.output_gate_type == "sigmoid"
-    assert config.mtp_hc
+    assert config.spec_hidden_size == 32
+    assert config.spec_decode_returns_tuple
+
+
+def test_qwen3_8_flash_next_legacy_mtp_hc_does_not_change_mtp_protocol() -> None:
+    config = _text_config(mtp_hc=False)
+
+    assert not config.mtp_hc
+    assert config.spec_hidden_size == 32
+    assert config.spec_decode_returns_tuple
+
+
+def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
+    from vllm.models.qwen3_8_flash_next.nvidia.mtp import (
+        Qwen3_8FlashNextMultiTokenPredictor,
+    )
+
+    model = object.__new__(Qwen3_8FlashNextMultiTokenPredictor)
+    torch.nn.Module.__init__(model)
+    model.hc_count = 2
+    model.hidden_size = 4
+    model.num_mtp_layers = 1
+    model.layers = [
+        lambda **kwargs: (kwargs["hidden_states"], None),
+    ]
+    model.hyper_connection_mixer = SimpleNamespace(
+        mix=lambda hidden_states: (
+            hidden_states.unflatten(-1, (2, 4)).mean(dim=-2),
+            None,
+        )
+    )
+    multi_hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
+
+    with patch(
+        "vllm.models.qwen3_8_flash_next.nvidia.mtp.get_pp_group",
+        return_value=pp_group,
+    ):
+        sample_hidden, returned_multi_hidden = model.forward(
+            input_ids=None,
+            positions=torch.arange(2),
+            intermediate_tensors={"hidden_states": multi_hidden},
+        )
+
+    torch.testing.assert_close(
+        sample_hidden,
+        multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
+    )
+    assert returned_multi_hidden is multi_hidden
+
+
+def test_qwen3_8_flash_next_legacy_use_hc_does_not_change_hc_layout() -> None:
+    config = _text_config(use_hc=False)
+
+    assert not config.use_hc
+    assert config.hc_count == 2
     assert config.spec_hidden_size == 32
 
 
@@ -223,6 +272,86 @@ def test_qwen3_8_flash_next_model_state_prepares_stable_dummy_ngram_inputs() -> 
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+def test_qwen3_8_flash_next_model_state_skips_ngram_state_without_ple() -> None:
+    def init_base_state(
+        state,
+        vllm_config,
+        model,
+        encoder_cache,
+        device,
+    ) -> None:
+        state.model_config = vllm_config.model_config
+        state.max_num_reqs = 4
+        state.device = device
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_layer_ids=[]),
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    with patch.object(MambaHybridModelState, "__init__", init_base_state):
+        model_state = Qwen3_8FlashNextModelState(
+            vllm_config,
+            torch.nn.Identity(),
+            None,
+            torch.device("cpu"),
+        )
+
+    assert not model_state.uses_ngram_embedding
+    assert model_state.ngram_context_len == 0
+    assert model_state.ngram_eos_token_id == 0
+    assert not hasattr(model_state, "ngram_context")
+    base_inputs = {"input_ids": torch.tensor([1])}
+    with (
+        patch.object(
+            MambaHybridModelState,
+            "prepare_inputs",
+            return_value=base_inputs,
+        ),
+        patch.object(
+            MambaHybridModelState,
+            "prepare_dummy_inputs",
+            return_value=base_inputs,
+        ),
+    ):
+        assert (
+            model_state.prepare_inputs(SimpleNamespace(), SimpleNamespace())
+            is base_inputs
+        )
+        assert model_state.prepare_dummy_inputs(1, 1) is base_inputs
+
+
+def test_qwen3_8_flash_next_model_state_rejects_pp_with_ple() -> None:
+    def init_base_state(
+        state,
+        vllm_config,
+        model,
+        encoder_cache,
+        device,
+    ) -> None:
+        state.model_config = vllm_config.model_config
+        state.max_num_reqs = 4
+        state.device = device
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    with (
+        patch.object(MambaHybridModelState, "__init__", init_base_state),
+        pytest.raises(RuntimeError, match="pipeline_parallel_size=1"),
+    ):
+        Qwen3_8FlashNextModelState(
+            vllm_config,
+            torch.nn.Identity(),
+            None,
+            torch.device("cpu"),
+        )
 
 
 def test_qwen3_8_flash_next_ple_builder_receives_spec_decode_metadata() -> None:

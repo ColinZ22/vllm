@@ -32,24 +32,16 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
-        use_hc: bool = True,
         hc_count: int = 4,
-        hc_method: str = "gated_residual_simple",
-        hc_final_method: str = "gated_residual_simple",
         hc_lowrank: int = 320,
-        hc_per_branch_norm: bool = True,
-        use_ple: bool = True,
         ple_layer_ids: list[int] | None = None,
-        ple_embedding_backend: str = "ngram",
         ple_embed_dim: int | None = None,
         ple_conv_kernel_size: int = 4,
-        ple_norm_affine_per_branch: bool = True,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
         ngram_vocab_size_base: int = 20_000_000,
         make_ngram_vocab_size_divisible_by: int = 128,
         output_gate_type: str = "sigmoid",
-        mtp_hc: bool | None = None,
         rope_parameters: dict[str, Any] | None = None,
         layer_types: list[str] | None = None,
         **kwargs: Any,
@@ -58,8 +50,6 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
             raise ValueError(
                 f"Qwen3.8-Flash-Next requires hc_count > 1, got {hc_count}."
             )
-        if not use_hc:
-            raise ValueError("Qwen3.8-Flash-Next requires use_hc=true")
 
         if rope_parameters is not None:
             if kwargs.get("rope_scaling") is None:
@@ -85,33 +75,18 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
         self.rope_parameters = rope_parameters or normalized_rope_parameters
         self.rope_theta = rope_theta
 
-        self.use_hc = use_hc
         self.hc_count = hc_count
-        self.hc_method = hc_method
-        self.hc_final_method = hc_final_method
         self.hc_lowrank = hc_lowrank
-        self.hc_per_branch_norm = hc_per_branch_norm
-        self.use_ple = use_ple
         self.ple_layer_ids = ple_layer_ids or []
-        self.ple_embedding_backend = ple_embedding_backend
         self.ple_embed_dim = (
             self.hidden_size if ple_embed_dim is None else ple_embed_dim
         )
         self.ple_conv_kernel_size = ple_conv_kernel_size
-        self.ple_norm_affine_per_branch = ple_norm_affine_per_branch
         self.ngram_size = ngram_size
         self.heads_per_ngram = heads_per_ngram
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
         self.output_gate_type = output_gate_type
-        if mtp_hc is None:
-            mtp_config = getattr(self, "mtp", None)
-            mtp_hc = (
-                bool(mtp_config.get("hybrid", False))
-                if isinstance(mtp_config, dict)
-                else bool(getattr(mtp_config, "hybrid", False))
-            )
-        self.mtp_hc = mtp_hc
 
         self._validate_ple_config()
         self._validate_ple_layer_ids()

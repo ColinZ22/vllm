@@ -13,6 +13,9 @@ from vllm.models.qwen3_8_flash_next.common.ple import (
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
 )
+from vllm.models.qwen3_8_flash_next.nvidia.model import (
+    Qwen3_8FlashNextDecoderLayer,
+)
 from vllm.models.qwen3_8_flash_next.nvidia.ple_layer import (
     Qwen3_8FlashNextNGramEmbedding,
     Qwen3_8FlashNextPLELayer,
@@ -26,7 +29,6 @@ def _make_ngram_embedding_for_load_test() -> Qwen3_8FlashNextNGramEmbedding:
     module.register_buffer("layer_multipliers", torch.zeros(1, dtype=torch.long))
     module.register_buffer("ngram_heads_offsets", torch.zeros(1, dtype=torch.long))
     module.register_buffer("ngram_heads_vocab_sizes", torch.zeros(1, dtype=torch.long))
-    module.register_buffer("token_lookup", torch.zeros(3, dtype=torch.long))
     module.ngram_embedding = SimpleNamespace(
         org_vocab_size=8,
         embedding_dim=2,
@@ -74,7 +76,7 @@ def test_ple_shard_copy_is_a_noop_without_overlap() -> None:
     assert torch.equal(destination, torch.ones_like(destination))
 
 
-def test_ngram_embedding_loads_checkpoint_shards_into_tp_range() -> None:
+def test_ngram_embedding_loads_shards_and_ignores_legacy_token_lookup() -> None:
     module = _make_ngram_embedding_for_load_test()
     shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     shard_1 = torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
@@ -87,12 +89,11 @@ def test_ngram_embedding_loads_checkpoint_shards_into_tp_range() -> None:
         ]
     )
 
-    assert loaded == {"ngram_embedding.weight", "token_lookup"}
+    assert loaded == {"ngram_embedding.weight"}
     torch.testing.assert_close(
         module.ngram_embedding.weight,
         torch.cat((shard_0[2:4], shard_1[0:2])),
     )
-    assert torch.equal(module.token_lookup, torch.tensor([2, 1, 0]))
 
 
 def test_ngram_embedding_rejects_mismatched_checkpoint_shard() -> None:
@@ -103,6 +104,22 @@ def test_ngram_embedding_rejects_mismatched_checkpoint_shard() -> None:
         match=r"Shape mismatch for PLE embedding shard 0",
     ):
         module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(3, 2))])
+
+
+def test_decoder_rejects_missing_ngram_context_for_ple() -> None:
+    module = Qwen3_8FlashNextDecoderLayer.__new__(Qwen3_8FlashNextDecoderLayer)
+    nn.Module.__init__(module)
+    module.ple = nn.Identity()
+
+    with pytest.raises(ValueError, match="ngram PLE requires ngram_context"):
+        module(
+            hidden_states=torch.zeros(1, 1),
+            residual=None,
+            positions=torch.zeros(1, dtype=torch.long),
+            input_ids=torch.zeros(1, dtype=torch.long),
+            query_start_loc=torch.tensor([0, 1]),
+            ngram_context=None,
+        )
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
