@@ -57,14 +57,6 @@ def test_qwen3_8_flash_next_framework_defaults_enable_architecture_features() ->
     assert config.spec_decode_returns_tuple
 
 
-def test_qwen3_8_flash_next_legacy_mtp_hc_does_not_change_mtp_protocol() -> None:
-    config = _text_config(mtp_hc=False)
-
-    assert not config.mtp_hc
-    assert config.spec_hidden_size == 32
-    assert config.spec_decode_returns_tuple
-
-
 def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
     from vllm.models.qwen3_8_flash_next.nvidia.mtp import (
         Qwen3_8FlashNextMultiTokenPredictor,
@@ -76,7 +68,7 @@ def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
     model.hidden_size = 4
     model.num_mtp_layers = 1
     model.layers = [
-        lambda **kwargs: (kwargs["hidden_states"], None),
+        lambda **kwargs: kwargs["hidden_states"],
     ]
     model.hyper_connection_mixer = SimpleNamespace(
         mix=lambda hidden_states: (
@@ -102,14 +94,6 @@ def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
         multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
     )
     assert returned_multi_hidden is multi_hidden
-
-
-def test_qwen3_8_flash_next_legacy_use_hc_does_not_change_hc_layout() -> None:
-    config = _text_config(use_hc=False)
-
-    assert not config.use_hc
-    assert config.hc_count == 2
-    assert config.spec_hidden_size == 32
 
 
 def test_qwen3_8_flash_next_qsa_enables_per_group_draft_metadata() -> None:
@@ -214,6 +198,39 @@ def test_qwen3_8_flash_next_registers_v2_model_state() -> None:
         Qwen3_8FlashNextForConditionalGeneration.get_model_state_cls()
         is Qwen3_8FlashNextModelState
     )
+
+
+def test_qwen3_8_flash_next_uses_local_moe_metadata() -> None:
+    from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+    from vllm.models.qwen3_8_flash_next.nvidia.model import (
+        Qwen3_8FlashNextDecoderLayer,
+        Qwen3_8FlashNextMixtureOfExperts,
+        Qwen3_8FlashNextSparseMoeBlock,
+    )
+
+    assert not issubclass(Qwen3_8FlashNextMixtureOfExperts, QwenNextMixtureOfExperts)
+
+    layer = Qwen3_8FlashNextDecoderLayer.__new__(Qwen3_8FlashNextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    moe = Qwen3_8FlashNextSparseMoeBlock.__new__(Qwen3_8FlashNextSparseMoeBlock)
+    torch.nn.Module.__init__(moe)
+    moe.experts = torch.nn.Identity()
+    moe.n_logical_experts = 8
+    moe.n_physical_experts = 10
+    moe.n_local_physical_experts = 5
+    moe.n_routed_experts = 8
+    moe.n_shared_experts = 1
+    moe.n_redundant_experts = 2
+    layer.mlp = moe
+
+    metadata = Qwen3_8FlashNextMixtureOfExperts()
+    metadata.set_moe_parameters([layer])
+
+    assert metadata.moe_layers == [moe.experts]
+    assert metadata.num_moe_layers == 1
+    assert metadata.num_logical_experts == 8
+    assert metadata.num_physical_experts == 10
+    assert metadata.num_shared_experts == 1
 
 
 def test_qwen3_8_flash_next_model_state_prepares_ngram_context() -> None:

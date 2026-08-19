@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import cast
 
 import torch
 from torch import nn
@@ -15,6 +15,9 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.transformers_utils.configs.qwen3_8_flash_next import (
+    Qwen3_8FlashNextTextConfig,
+)
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -71,7 +74,7 @@ class QSAIndexer(nn.Module):
         self,
         *,
         vllm_config: VllmConfig,
-        config: Any,
+        config: Qwen3_8FlashNextTextConfig,
         layer_id: int,
         rotary_emb: nn.Module,
         quant_config: QuantizationConfig | None = None,

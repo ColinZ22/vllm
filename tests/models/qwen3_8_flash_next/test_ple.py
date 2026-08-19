@@ -13,9 +13,6 @@ from vllm.models.qwen3_8_flash_next.common.ple import (
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
 )
-from vllm.models.qwen3_8_flash_next.nvidia.model import (
-    Qwen3_8FlashNextDecoderLayer,
-)
 from vllm.models.qwen3_8_flash_next.nvidia.ple_layer import (
     Qwen3_8FlashNextNGramEmbedding,
     Qwen3_8FlashNextPLELayer,
@@ -104,22 +101,6 @@ def test_ngram_embedding_rejects_mismatched_checkpoint_shard() -> None:
         match=r"Shape mismatch for PLE embedding shard 0",
     ):
         module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(3, 2))])
-
-
-def test_decoder_rejects_missing_ngram_context_for_ple() -> None:
-    module = Qwen3_8FlashNextDecoderLayer.__new__(Qwen3_8FlashNextDecoderLayer)
-    nn.Module.__init__(module)
-    module.ple = nn.Identity()
-
-    with pytest.raises(ValueError, match="ngram PLE requires ngram_context"):
-        module(
-            hidden_states=torch.zeros(1, 1),
-            residual=None,
-            positions=torch.zeros(1, dtype=torch.long),
-            input_ids=torch.zeros(1, dtype=torch.long),
-            query_start_loc=torch.tensor([0, 1]),
-            ngram_context=None,
-        )
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:

@@ -47,10 +47,8 @@ from vllm.model_executor.models.qwen3_5 import (
 )
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
-    Qwen3NextDecoderLayer,
     Qwen3NextMLP,
     Qwen3NextSparseMoeBlock,
-    QwenNextMixtureOfExperts,
 )
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -60,7 +58,6 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
@@ -152,25 +149,27 @@ class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen3.8-Flash-Next HC validation."""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next HC does not support sequence-parallel MoE"
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        config = vllm_config.model_config.hf_text_config
+        self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
         # The current FusedMoEFactory owns its final tensor-parallel
         # reduction. Do not reduce the result a second time in the HC caller.
         self.requires_tp_all_reduce = False
 
 
-class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
+class Qwen3_8FlashNextDecoderLayer(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
         layer_type: str,
         prefix: str = "",
-        force_disable_ple: bool = False,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -185,7 +184,7 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
             )
         self.ple: Qwen3_8FlashNextPLELayer | None = None
         ple_layer_ids = config.ple_layer_ids
-        if (self.layer_idx + 1) in ple_layer_ids and not force_disable_ple:
+        if (self.layer_idx + 1) in ple_layer_ids:
             ple_layer_ids_sorted = sorted(set(ple_layer_ids))
             ple_dense_layer_id_map = {
                 abs_id: idx for idx, abs_id in enumerate(ple_layer_ids_sorted)
@@ -272,23 +271,15 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
         positions: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        del kwargs
-        if residual is not None:
-            raise ValueError("HC layers do not use a separate residual tensor")
+        *,
+        input_ids: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        ngram_context: torch.Tensor | None,
+    ) -> torch.Tensor:
         if self.ple is not None:
-            if input_ids is None:
-                raise ValueError("PLE requires input_ids")
-            if query_start_loc is None:
-                raise ValueError("ngram PLE requires query_start_loc")
-            if ngram_context is None:
-                raise ValueError("ngram PLE requires ngram_context")
+            if input_ids is None or query_start_loc is None or ngram_context is None:
+                raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
                 hidden_states,
                 input_ids,
@@ -318,7 +309,57 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = self.mlp_hyper_connection.combine(hidden_states, hc_residual)
-        return hidden_states, None
+        return hidden_states
+
+
+class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
+    """Expose Qwen3.8-Flash-Next routed experts through vLLM's EPLB protocol."""
+
+    def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
+        self.moe_layers = []
+        self.moe_mlp_layers = []
+        example_moe = None
+        for layer in layers:
+            if isinstance(layer, Qwen3_8FlashNextDecoderLayer) and isinstance(
+                layer.mlp, Qwen3_8FlashNextSparseMoeBlock
+            ):
+                example_moe = layer.mlp
+                self.moe_mlp_layers.append(layer.mlp)
+                self.moe_layers.append(layer.mlp.experts)
+
+        self.num_moe_layers = len(self.moe_layers)
+        if example_moe is None:
+            self.num_expert_groups = 0
+            self.num_shared_experts = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_redundant_experts = 0
+            return
+
+        self.num_expert_groups = 1
+        self.num_shared_experts = example_moe.n_shared_experts
+        self.num_logical_experts = example_moe.n_logical_experts
+        self.num_physical_experts = example_moe.n_physical_experts
+        self.num_local_physical_experts = example_moe.n_local_physical_experts
+        self.num_routed_experts = example_moe.n_routed_experts
+        self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.n_physical_experts = num_physical_experts
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
 
 @support_torch_compile(
@@ -423,20 +464,17 @@ class Qwen3_8FlashNextModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None
 
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 hidden_states=hidden_states,
-                residual=residual,
                 positions=positions,
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
@@ -511,7 +549,7 @@ class Qwen3_8FlashNextForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
-    QwenNextMixtureOfExperts,
+    Qwen3_8FlashNextMixtureOfExperts,
     IsHybrid,
 ):
     packed_modules_mapping = {
@@ -550,9 +588,7 @@ class Qwen3_8FlashNextForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        # Set MoE hyperparameters
-        if (getattr(config, "num_experts", 0) or 0) > 0:
-            QwenNextMixtureOfExperts.set_moe_parameters(self)
+        self.set_moe_parameters(self.model.layers)
 
     @staticmethod
     def get_model_state_cls():
@@ -714,7 +750,6 @@ class Qwen3_8FlashNextForCausalLM(
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
-        del mm_features
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
@@ -725,60 +760,6 @@ class Qwen3_8FlashNextForCausalLM(
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-
-class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
-    """Expose Qwen3.8-Flash-Next routed experts through vLLM's EPLB protocol."""
-
-    language_model: Qwen3_8FlashNextForCausalLM
-
-    def _set_moe_parameters(self) -> None:
-        self.moe_layers = []
-        self.moe_mlp_layers = []
-        example_moe = None
-        language_model = getattr(self, "model", None)
-        if language_model is None:
-            language_model = self.language_model.model
-        for layer in language_model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                example_moe = layer.mlp
-                self.moe_mlp_layers.append(layer.mlp)
-                self.moe_layers.append(layer.mlp.experts)
-
-        self.num_moe_layers = len(self.moe_layers)
-        if example_moe is None:
-            self.num_expert_groups = 1
-            self.num_shared_experts = 0
-            self.num_logical_experts = 0
-            self.num_physical_experts = 0
-            self.num_local_physical_experts = 0
-            self.num_routed_experts = 0
-            self.num_redundant_experts = 0
-            return
-
-        self.num_expert_groups = 1
-        self.num_shared_experts = 0
-        self.num_logical_experts = example_moe.n_logical_experts
-        self.num_physical_experts = example_moe.n_physical_experts
-        self.num_local_physical_experts = example_moe.n_local_physical_experts
-        self.num_routed_experts = example_moe.n_routed_experts
-        self.num_redundant_experts = example_moe.n_redundant_experts
-
-    def update_physical_experts_metadata(
-        self,
-        num_physical_experts: int,
-        num_local_physical_experts: int,
-    ) -> None:
-        self.num_physical_experts = num_physical_experts
-        self.num_local_physical_experts = num_local_physical_experts
-        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for moe in self.moe_mlp_layers:
-            moe.n_physical_experts = num_physical_experts
-            moe.n_local_physical_experts = num_local_physical_experts
-            moe.n_redundant_experts = self.num_redundant_experts
-            moe.experts.update_expert_map()
 
 
 class Qwen3_8FlashNextProcessingInfo(Qwen3VLProcessingInfo):
@@ -882,7 +863,7 @@ class Qwen3_8FlashNextForConditionalGeneration(
                 "start_layer should be greater than or equal to "
                 "len(deepstack_visual_indexes)"
             )
-        self._set_moe_parameters()
+        self.set_moe_parameters(self.language_model.model.layers)
 
     def embed_input_ids(
         self,
@@ -1009,6 +990,7 @@ __all__ = [
     "Qwen3_8FlashNextDecoderLayer",
     "Qwen3_8FlashNextForCausalLM",
     "Qwen3_8FlashNextForConditionalGeneration",
+    "Qwen3_8FlashNextMixtureOfExperts",
     "Qwen3_8FlashNextModel",
     "Qwen3_8FlashNextSparseMoeBlock",
 ]

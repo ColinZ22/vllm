@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, cast
+from typing import ClassVar, cast
 
 import torch
 from torch import nn
@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.qwen3_8_flash_next import (
+    Qwen3_8FlashNextTextConfig,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -168,7 +171,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self,
         *,
         vllm_config: VllmConfig,
-        config: Any,
+        config: Qwen3_8FlashNextTextConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = False,

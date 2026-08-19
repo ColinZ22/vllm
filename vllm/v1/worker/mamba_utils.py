@@ -648,8 +648,6 @@ class MambaSpecDecodeGPUContext:
 
     # Configuration
     block_size: int
-    num_layers: int
-    num_state_types: int
     num_states: int
     mamba_group_ids: list[int]
     num_groups: int
@@ -701,14 +699,9 @@ class MambaSpecDecodeGPUContext:
         copy_funcs_by_spec = {
             spec: copy_funcs[spec.mamba_type] for spec in mamba_groups
         }
-        num_state_types = max(len(funcs) for funcs in copy_funcs_by_spec.values())
 
-        # Count total layers and physical state tensors across all Mamba
-        # groups. Different groups may expose different state specs.
-        num_layers = sum(
-            len(kv_cache_config.kv_cache_groups[gid].layer_names)
-            for gid in mamba_group_ids
-        )
+        # Count physical state tensors across all Mamba groups. Different
+        # groups may expose different state specs.
         total_states = sum(
             len(copy_funcs_by_spec[mamba_group_spec])
             * sum(
@@ -744,8 +737,6 @@ class MambaSpecDecodeGPUContext:
                 total_states, dtype=torch.int64, device=device
             ),
             block_size=mamba_spec.block_size,
-            num_layers=num_layers,
-            num_state_types=num_state_types,
             num_states=total_states,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),

@@ -32,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
-from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -53,7 +52,7 @@ from ..common.hyperconnection import (
 from .model import (
     _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES,
     Qwen3_8FlashNextDecoderLayer,
-    Qwen3_8FlashNextSparseMoeBlock,
+    Qwen3_8FlashNextMixtureOfExperts,
 )
 
 
@@ -203,7 +202,6 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
                 Qwen3_8FlashNextDecoderLayer(
                     draft_vllm_config,
                     layer_type="full_attention",
-                    force_disable_ple=True,
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
                 )
                 for idx in range(self.num_mtp_layers)
@@ -222,7 +220,9 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             ["hidden_states"], self.hidden_size * self.hc_count
         )
 
-    def _build_final_mixer(self, config: Qwen3_8FlashNextTextConfig):
+    def _build_final_mixer(
+        self, config: Qwen3_8FlashNextTextConfig
+    ) -> GatedResidualSimple:
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
@@ -250,11 +250,9 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-        query_start_loc: torch.Tensor | None = None,
-        ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         hc_count = self.hc_count
-        H = self.hidden_size
+        hidden_size = self.hidden_size
 
         if get_pp_group().is_first_rank:
             assert hidden_states is not None
@@ -269,31 +267,28 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             # the main model truly emits the pre-final-mixer multi stream
             # on the first step; subsequent steps reuse the prior draft
             # step's multi stream).
-            T = hidden_states.shape[0]
-            hidden_states = hidden_states.view(T, hc_count, H)
+            num_tokens = hidden_states.shape[0]
+            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
             hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                T, hc_count, H
+                num_tokens, hc_count, hidden_size
             )
             hidden_states = self.fc_hidden(hidden_states)
             # Add the embedding residual to every branch, then fold back
             # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
             hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
             hidden_states = hidden_states.flatten(-2)
-            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
-        hidden_states, residual = layer(
+        hidden_states = layer(
             hidden_states=hidden_states,
-            residual=residual,
             positions=positions,
-            input_ids=input_ids,
-            query_start_loc=query_start_loc,
-            ngram_context=ngram_context,
+            input_ids=None,
+            query_start_loc=None,
+            ngram_context=None,
         )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -330,7 +325,7 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
+class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, Qwen3_8FlashNextMixtureOfExperts):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -373,18 +368,7 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        # MoE metadata. The MTP layer (idx == num_hidden_layers) is a MoE
-        # block under the real config; guard with a light fallback so a future
-        # dense MTP layer does not crash here.
-        if self._has_moe_layer():
-            self.set_moe_parameters()
-
-    def _has_moe_layer(self) -> bool:
-        return any(
-            isinstance(layer, Qwen3_8FlashNextDecoderLayer)
-            and isinstance(layer.mlp, Qwen3_8FlashNextSparseMoeBlock)
-            for layer in self.model.layers
-        )
+        self.set_moe_parameters(self.model.layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -397,7 +381,6 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-        **kwargs: object,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         return self.model(
             input_ids,
@@ -406,8 +389,6 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
             intermediate_tensors,
             inputs_embeds,
             spec_step_idx=spec_step_idx,
-            query_start_loc=kwargs.get("query_start_loc"),
-            ngram_context=kwargs.get("ngram_context"),
         )
 
     def compute_logits(
