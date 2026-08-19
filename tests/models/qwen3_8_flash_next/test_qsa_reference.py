@@ -12,7 +12,6 @@ from vllm.models.qwen3_8_flash_next.nvidia import (
     model as _qwen3_8_flash_next_model,  # noqa: F401
 )
 from vllm.models.qwen3_8_flash_next.nvidia.ops import qsa as qsa_ops
-from vllm.models.qwen3_8_flash_next.nvidia.qsa import qsa_token_to_request
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
@@ -164,14 +163,6 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
-def test_qsa_request_mapping_marks_cudagraph_padding_inert() -> None:
-    query_start_loc = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32)
-
-    token_to_req = qsa_token_to_request(query_start_loc, num_tokens=16)
-
-    assert token_to_req.tolist() == [0] * 4 + [1] * 4 + [2] * 4 + [3] * 4
-
-
 def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 1
@@ -247,28 +238,25 @@ def test_qsa_mqa_paged_matches_test_reference() -> None:
     cache = torch.randn(5, 4, 1, 16, device="cuda", dtype=torch.bfloat16)
     page_table = torch.tensor([[3, 1], [4, 2]], device="cuda", dtype=torch.int32)
     token_to_req = torch.tensor([0, 1, 0], device="cuda", dtype=torch.int32)
+    query_positions = torch.tensor([4, 1, 6], device="cuda", dtype=torch.int32)
+    sequence_lengths = torch.tensor([8, 2], device="cuda", dtype=torch.int32)
     visible_lengths = torch.tensor([5, 2, 7], device="cuda", dtype=torch.int32)
 
-    actual = qsa_ops.qsa_mqa_paged(q, cache, page_table, token_to_req, visible_lengths)
+    actual, actual_visible_blocks = qsa_ops.qsa_mqa_paged(
+        q,
+        cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio=1,
+    )
     expected = _qsa_mqa_paged_reference(
         q, cache, page_table, token_to_req, visible_lengths
     )
 
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
-
-
-@requires_qsa_kernels
-def test_qsa_relative_topk_is_request_relative() -> None:
-    logits = torch.full((2, 9), -torch.inf, device="cuda")
-    logits[0, 3:7] = torch.tensor([1, 9, 2, 8], device="cuda")
-    logits[1, 1:4] = torch.tensor([6, 7, 5], device="cuda")
-    starts = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    ends = torch.tensor([7, 4], device="cuda", dtype=torch.int32)
-
-    actual = qsa_ops.qsa_relative_topk_cuda(logits, starts, ends, topk=4)
-    expected = _qsa_relative_topk_reference(logits, starts, ends, topk=4)
-
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_visible_blocks, visible_lengths)
 
 
 @requires_qsa_kernels
@@ -276,11 +264,13 @@ def test_qsa_block_expansion_matches_test_reference() -> None:
     blocks = torch.tensor([[0, -1], [1, 0]], device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([5, 10], device="cuda")
     sequence_lengths = torch.tensor([6, 11], device="cuda")
+    token_to_req = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
 
     actual = qsa_ops.expand_qsa_block_indices_cuda(
         blocks,
         query_positions,
         sequence_lengths,
+        token_to_req,
         compress_ratio=4,
         token_topk=8,
     )
@@ -335,16 +325,17 @@ def test_qsa_sparse_paged_attention_matches_test_reference() -> None:
 @requires_qsa_kernels
 def test_qsa_selection_chunks_workspace_and_matches_test_reference(
     monkeypatch: pytest.MonkeyPatch,
+    workspace_init,
 ) -> None:
-    rows, keys, heads, head_dim = 65, 64, 4, 16
-    token_topk, compress_ratio = 8, 4
+    rows, keys, heads, head_dim = 65, 640, 4, 16
+    token_topk, compress_ratio = 2048, 4
     torch.manual_seed(3)
     q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    cache = torch.randn(4, 16, 1, head_dim, device="cuda", dtype=torch.bfloat16)
-    page_table = torch.tensor([[3, 1, 0, 2]], device="cuda", dtype=torch.int32)
+    cache = torch.randn(40, 16, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    page_table = torch.randperm(40, device="cuda", dtype=torch.int32).unsqueeze(0)
     token_to_req = torch.zeros(rows, device="cuda", dtype=torch.int32)
-    query_positions = torch.full((rows,), 255, device="cuda", dtype=torch.int32)
-    sequence_lengths = torch.tensor([256], device="cuda", dtype=torch.int32)
+    query_positions = torch.full((rows,), 2559, device="cuda", dtype=torch.int32)
+    sequence_lengths = torch.tensor([2560], device="cuda", dtype=torch.int32)
     monkeypatch.setattr(qsa_ops, "_LOGITS_WORKSPACE_BYTES", 32 * keys * 4)
     original_score = qsa_ops.qsa_mqa_paged
     scored_row_counts = []
@@ -381,7 +372,7 @@ def test_qsa_selection_chunks_workspace_and_matches_test_reference(
 
 
 @requires_qsa_kernels
-def test_qsa_selection_handles_no_complete_compressed_blocks() -> None:
+def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> None:
     q = torch.zeros(2, 4, 8, device="cuda", dtype=torch.bfloat16)
     cache = torch.zeros(1, 16, 1, 8, device="cuda", dtype=torch.bfloat16)
     page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
@@ -396,7 +387,7 @@ def test_qsa_selection_handles_no_complete_compressed_blocks() -> None:
         token_to_req,
         query_positions,
         sequence_lengths,
-        token_topk=8,
+        token_topk=2048,
         compress_ratio=4,
     )
 

@@ -14,9 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding.mrope import (
-    apply_interleaved_rope,
-)
+from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -33,54 +31,31 @@ def apply_qsa_rope(
 ) -> torch.Tensor:
     """Apply the main attention's exact 1D/MRoPE composition to QSA heads."""
 
-    if tensor.ndim != 3:
-        raise ValueError("QSA RoPE input must be [tokens, heads, head_dim]")
     num_tokens, _, head_dim = tensor.shape
-    if positions.ndim not in (1, 2) or positions.shape[-1] != num_tokens:
-        raise ValueError("QSA RoPE positions must match the token dimension")
-    rotary_dim = int(getattr(rotary_emb, "rotary_dim", 0))
-    if not 0 < rotary_dim <= head_dim or rotary_dim % 2:
-        raise ValueError(
-            "QSA requires an even main-attention rotary dimension that fits "
-            f"the index head, got rotary_dim={rotary_dim}, head_dim={head_dim}"
-        )
-    cache = getattr(rotary_emb, "cos_sin_cache", None)
-    apply_rotary_emb = getattr(rotary_emb, "apply_rotary_emb", None)
-    if cache is None or apply_rotary_emb is None:
-        raise NotImplementedError(
-            "QSA only supports RoPE implementations exposing cos_sin_cache "
-            "and apply_rotary_emb"
-        )
-    if hasattr(rotary_emb, "_match_cos_sin_cache_dtype"):
-        cache = rotary_emb._match_cos_sin_cache_dtype(tensor)  # noqa: SLF001
-    else:
-        cache = cache.to(device=tensor.device, dtype=tensor.dtype)
-
-    positions = positions.to(device=tensor.device, dtype=torch.long)
+    rotary_dim = rotary_emb.rotary_dim
+    cache = rotary_emb._match_cos_sin_cache_dtype(tensor)  # noqa: SLF001
     cos_sin = cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
     if positions.ndim == 2:
-        sections = getattr(rotary_emb, "mrope_section", None)
-        if not sections:
-            raise ValueError("three-axis QSA positions require the main MRoPE")
-        if getattr(rotary_emb, "mrope_interleaved", False):
-            cos = apply_interleaved_rope(cos, sections)
-            sin = apply_interleaved_rope(sin, sections)
-        else:
-            cos = torch.cat(
-                [part[i] for i, part in enumerate(cos.split(sections, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [part[i] for i, part in enumerate(sin.split(sections, dim=-1))],
-                dim=-1,
-            )
+        shape = tensor.shape
+        tensor, _ = triton_mrope(
+            tensor.reshape(num_tokens, -1),
+            tensor.new_empty((num_tokens, head_dim)),
+            cos,
+            sin,
+            rotary_emb.mrope_section,
+            head_dim,
+            rotary_dim,
+            rotary_emb.mrope_interleaved,
+            rotary_emb.is_neox_style,
+        )
+        return tensor.reshape(shape)
 
-    rotated = tensor[..., :rotary_dim]
-    if hasattr(apply_rotary_emb, "forward_native"):
-        rotated = apply_rotary_emb.forward_native(rotated, cos, sin)
-    else:
-        rotated = apply_rotary_emb(rotated, cos, sin)
+    rotated = rotary_emb.apply_rotary_emb.forward_cuda(
+        tensor[..., :rotary_dim],
+        cos,
+        sin,
+    )
     return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
 
 
@@ -163,6 +138,8 @@ class QSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project replicated Q/K, normalize+rotate Q, and preserve raw K."""
 
+        from flashinfer.norm import gemma_rmsnorm
+
         qk, _ = self.index_qk_proj(hidden_states)
         q_raw, token_k = qk.split(
             (
@@ -172,7 +149,11 @@ class QSAIndexer(nn.Module):
             dim=-1,
         )
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
-        q = self.q_layernorm(q.reshape(-1, self.index_head_dim)).reshape_as(q)
+        q = gemma_rmsnorm(
+            q.reshape(-1, self.index_head_dim),
+            self.q_layernorm.weight,
+            self.q_layernorm.variance_epsilon,
+        ).reshape_as(q)
         q = apply_qsa_rope(self.rotary_emb, positions, q)
         return q, token_k.reshape(-1, 1, self.index_head_dim)
 
@@ -183,8 +164,14 @@ class QSAIndexer(nn.Module):
     ) -> torch.Tensor:
         """Normalize pooled K and apply the first token's exact group position."""
 
+        from flashinfer.norm import gemma_rmsnorm
+
         keys = compressed_keys.reshape(-1, self.index_head_dim)
-        keys = self.k_layernorm(keys).reshape(-1, 1, self.index_head_dim)
+        keys = gemma_rmsnorm(
+            keys,
+            self.k_layernorm.weight,
+            self.k_layernorm.variance_epsilon,
+        ).reshape(-1, 1, self.index_head_dim)
         if getattr(self.rotary_emb, "mrope_section", None):
             positions = first_rope_positions.transpose(0, 1)
         else:

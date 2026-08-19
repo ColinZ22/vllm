@@ -8,9 +8,12 @@ import math
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.worker.workspace import current_workspace_manager
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 @triton.jit
@@ -19,7 +22,9 @@ def _qsa_mqa_paged_kernel(
     k_cache_ptr,
     page_table_ptr,
     token_to_req_ptr,
-    visible_lengths_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
     logits_ptr,
     stride_q_row,
     stride_q_head,
@@ -41,12 +46,25 @@ def _qsa_mqa_paged_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     dims = tl.arange(0, BLOCK_D)
     request = tl.load(token_to_req_ptr + row)
-    visible = tl.load(visible_lengths_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_position = tl.load(query_positions_ptr + row)
+    sequence_length = tl.load(
+        sequence_lengths_ptr + safe_request,
+        mask=(request >= 0) & (request < num_requests),
+        other=0,
+    )
+    visible = tl.minimum(
+        (query_position + 1) // COMPRESS_RATIO,
+        sequence_length // COMPRESS_RATIO,
+    )
+    if tl.program_id(1) == 0:
+        tl.store(visible_blocks_ptr + row, visible)
     logical_page = columns // PAGE_SIZE
     page_offset = columns % PAGE_SIZE
     valid = (
@@ -57,7 +75,6 @@ def _qsa_mqa_paged_kernel(
         & (request < num_requests)
         & (logical_page < PAGE_TABLE_WIDTH)
     )
-    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
     safe_logical_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
     physical_page = tl.load(
         page_table_ptr
@@ -101,12 +118,14 @@ def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
     sequence_lengths_ptr,
+    token_to_req_ptr,
     output_ptr,
     stride_blocks_row,
     stride_blocks_column,
     stride_output_row,
     stride_output_column,
     rows,
+    num_requests,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     TOKEN_TOPK: tl.constexpr,
@@ -116,8 +135,20 @@ def _expand_qsa_indices_kernel(
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
     query_position = tl.load(query_positions_ptr + row)
-    sequence_length = tl.load(sequence_lengths_ptr + row)
-    complete_blocks = tl.minimum((query_position + 1) // COMPRESS_RATIO, BLOCK_TOPK)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    sequence_length = tl.load(
+        sequence_lengths_ptr + safe_request,
+        mask=(request >= 0) & (request < num_requests),
+        other=0,
+    )
+    complete_blocks = tl.minimum(
+        tl.minimum(
+            (query_position + 1) // COMPRESS_RATIO,
+            sequence_length // COMPRESS_RATIO,
+        ),
+        BLOCK_TOPK,
+    )
     expanded_count = complete_blocks * COMPRESS_RATIO
     tail_start = ((query_position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
     tail_count = (query_position + 1) - tail_start
@@ -465,10 +496,12 @@ def qsa_mqa_paged(
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
     token_to_req: torch.Tensor,
-    visible_lengths: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
     num_columns: int | None = None,
     score_scale: float | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
     _validate_mqa(q)
@@ -484,8 +517,12 @@ def qsa_mqa_paged(
         raise ValueError("QSA paged scoring cache and page table must be nonempty")
     if token_to_req.shape != (q.shape[0],):
         raise ValueError("QSA request mapping must match query rows")
-    if visible_lengths.shape != (q.shape[0],):
-        raise ValueError("QSA visible lengths must match query rows")
+    if query_positions.shape != (q.shape[0],):
+        raise ValueError("QSA query positions must match query rows")
+    if sequence_lengths.shape != (page_table.shape[0],):
+        raise ValueError("QSA sequence lengths must match page-table requests")
+    if compress_ratio <= 0:
+        raise ValueError("QSA compression ratio must be positive")
     score_divisor = math.sqrt(q.shape[2]) if score_scale is None else score_scale
     if score_divisor <= 0:
         raise ValueError("QSA score scale must be positive")
@@ -495,15 +532,18 @@ def qsa_mqa_paged(
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
-        return logits
+        return logits, visible_blocks
     block_n = 32
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
         k_cache,
         page_table,
         token_to_req,
-        visible_lengths,
+        query_positions,
+        sequence_lengths,
+        visible_blocks,
         logits,
         q.stride(0),
         q.stride(1),
@@ -525,49 +565,17 @@ def qsa_mqa_paged(
         HEAD_DIM=q.shape[2],
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
+        COMPRESS_RATIO=compress_ratio,
         num_warps=4,
     )
-    return logits
-
-
-def qsa_relative_topk_cuda(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    topk: int,
-) -> torch.Tensor:
-    """Select ragged top-k indices relative to each row's start on-device."""
-
-    if logits.ndim != 2 or topk <= 0:
-        raise ValueError("QSA logits must be rank two and topk must be positive")
-    if row_starts.shape != (logits.shape[0],) or row_ends.shape != (logits.shape[0],):
-        raise ValueError("QSA row ranges must match logits rows")
-    output = torch.full(
-        (logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device
-    )
-    candidate_count = min(topk, logits.shape[1])
-    if not logits.shape[0] or not candidate_count:
-        return output
-    candidates = torch.topk(logits, candidate_count, dim=1).indices
-    starts = row_starts.to(device=logits.device, dtype=torch.long)
-    lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.long)
-    ranks = torch.arange(candidate_count, device=logits.device).unsqueeze(0)
-    relative = candidates - starts.unsqueeze(1)
-    valid = (
-        (ranks < lengths.unsqueeze(1))
-        & (relative >= 0)
-        & (relative < lengths.unsqueeze(1))
-    )
-    output[:, :candidate_count] = torch.where(
-        valid, relative.to(torch.int32), torch.full_like(relative, -1).to(torch.int32)
-    )
-    return output
+    return logits, visible_blocks
 
 
 def expand_qsa_block_indices_cuda(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
@@ -582,8 +590,10 @@ def expand_qsa_block_indices_cuda(
     output_width = token_topk + compress_ratio - 1
     if block_indices.shape != (query_positions.numel(), block_topk):
         raise ValueError("QSA compressed top-k has an invalid shape")
-    if sequence_lengths.shape != query_positions.shape:
-        raise ValueError("QSA sequence lengths must match query positions")
+    if token_to_req.shape != query_positions.shape:
+        raise ValueError("QSA request mapping must match query positions")
+    if sequence_lengths.ndim != 1 or not sequence_lengths.shape[0]:
+        raise ValueError("QSA request sequence lengths must be nonempty")
     if out is None:
         out = torch.empty(
             (block_indices.shape[0], output_width),
@@ -601,12 +611,14 @@ def expand_qsa_block_indices_cuda(
         block_indices,
         query_positions,
         sequence_lengths,
+        token_to_req,
         out,
         block_indices.stride(0),
         block_indices.stride(1),
         out.stride(0),
         out.stride(1),
         block_indices.shape[0],
+        sequence_lengths.shape[0],
         BLOCK_TOPK=block_topk,
         COMPRESS_RATIO=compress_ratio,
         TOKEN_TOPK=token_topk,
@@ -640,34 +652,43 @@ def qsa_select_paged_tokens(
         return out
 
     columns = page_table.shape[1] * k_cache.shape[1]
-    row_sequence_lengths = sequence_lengths.index_select(0, token_to_req.long())
-    visible_blocks = torch.div(
-        query_positions + 1, compress_ratio, rounding_mode="floor"
-    ).to(torch.int32)
-    max_blocks = torch.div(
-        row_sequence_lengths, compress_ratio, rounding_mode="floor"
-    ).to(torch.int32)
-    visible_blocks = torch.minimum(visible_blocks, max_blocks)
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+    chunk_rows = min(rows, rows_per_chunk)
+    blocks_buffer, topk_workspace = current_workspace_manager().get_simultaneous(
+        ((chunk_rows, block_topk), torch.int32),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    )
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        logits = qsa_mqa_paged(
+        logits, visible_blocks = qsa_mqa_paged(
             q[row_slice],
             k_cache,
             page_table,
             token_to_req[row_slice],
-            visible_blocks[row_slice],
+            query_positions[row_slice],
+            sequence_lengths,
+            compress_ratio,
         )
-        starts = torch.zeros_like(visible_blocks[row_slice])
-        blocks = qsa_relative_topk_cuda(
-            logits, starts, visible_blocks[row_slice], block_topk
+        blocks = blocks_buffer[: row_end - row_start]
+        use_cooperative_topk = (
+            blocks.shape[0] <= 32
+            and logits.stride(0) % 4 == 0
+            and current_platform.has_device_capability(90)
+            and not current_platform.is_device_capability_family(120)
         )
+        topk_op = (
+            torch.ops._C.cooperative_topk
+            if use_cooperative_topk
+            else torch.ops._C.persistent_topk
+        )
+        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
-            row_sequence_lengths[row_slice],
+            sequence_lengths,
+            token_to_req[row_slice],
             compress_ratio,
             token_topk,
             out[row_slice],
@@ -886,7 +907,6 @@ __all__ = [
     "expand_qsa_block_indices_cuda",
     "qsa_compress_groups_with_ratio",
     "qsa_mqa_paged",
-    "qsa_relative_topk_cuda",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",

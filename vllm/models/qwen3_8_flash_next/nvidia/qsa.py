@@ -49,31 +49,9 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
-
-
-def qsa_token_to_request(
-    query_start_loc: torch.Tensor,
-    num_tokens: int,
-) -> torch.Tensor:
-    """Expand packed query boundaries into one request id per query token."""
-
-    if query_start_loc.ndim != 1 or query_start_loc.numel() == 0:
-        raise ValueError("query_start_loc must contain packed row boundaries")
-    query_lens = torch.diff(query_start_loc).long()
-    requests = torch.arange(
-        query_lens.numel(), dtype=torch.int32, device=query_start_loc.device
-    )
-    if num_tokens == 0:
-        return requests[:0]
-    padded_query_lens = query_lens.clone()
-    padded_query_lens[-1] += num_tokens - query_start_loc[-1]
-    return torch.repeat_interleave(
-        requests,
-        padded_query_lens,
-        output_size=num_tokens,
-    )
 
 
 class Qwen3_8FlashNextQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -129,7 +107,7 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
             )
         self.supports_quant_query_input = False
 
-    def forward(
+    def forward_qsa(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
@@ -138,6 +116,7 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
+        token_to_req: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -158,10 +137,7 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
         if topk_buffer is None:
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
-        token_to_req = qsa_token_to_request(
-            attn_metadata.query_start_loc,
-            num_tokens,
-        )
+        token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
@@ -373,6 +349,12 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise RuntimeError("QSA main K/V cache is not bound")
 
         num_tokens = main_metadata.num_actual_tokens
+        side_metadata = cast(
+            QSAForwardMetadata,
+            metadata[self.indexer.raw_key_cache.prefix],
+        )
+        if side_metadata.num_actual_tokens != num_tokens:
+            raise RuntimeError("QSA main and side metadata token counts disagree")
         selected = self.indexer(
             hidden_states,
             positions,
@@ -391,7 +373,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache,
             main_metadata.slot_mapping,
         )
-        impl.forward(
+        impl.forward_qsa(
             self,
             query,
             key,
@@ -399,6 +381,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache,
             main_metadata,
             output,
+            token_to_req=side_metadata.token_to_req,
         )
 
     def forward(
@@ -491,6 +474,5 @@ __all__ = [
     "Qwen3_8FlashNextQSAAttention",
     "Qwen3_8FlashNextQSAFlashAttentionBackend",
     "Qwen3_8FlashNextQSAFlashAttentionImpl",
-    "qsa_token_to_request",
     "qwen3_8_flash_next_qsa_with_output",
 ]
