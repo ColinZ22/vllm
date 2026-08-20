@@ -10,7 +10,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.v1.worker.workspace import current_workspace_manager
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -730,9 +729,11 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
-    blocks_buffer, topk_workspace = current_workspace_manager().get_simultaneous(
-        ((chunk_rows, block_topk), torch.int32),
-        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    blocks_buffer = torch.empty(
+        (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+    )
+    topk_workspace = torch.empty(
+        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
     )
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
