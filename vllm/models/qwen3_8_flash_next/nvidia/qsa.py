@@ -156,7 +156,6 @@ class Qwen3_8FlashNextQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
-            self.scale,
             output[:num_tokens],
         )
         return output

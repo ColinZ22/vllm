@@ -286,18 +286,87 @@ def test_qsa_block_expansion_matches_test_reference() -> None:
 
 
 @requires_qsa_kernels
-def test_qsa_sparse_paged_attention_matches_test_reference() -> None:
+@pytest.mark.parametrize(
+    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
+    [
+        # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
+        pytest.param(1, 24, 2, 1792, id="tp1_split64"),
+        pytest.param(16, 12, 1, 1792, id="tp2_split32"),
+        pytest.param(32, 6, 1, 1024, id="tp4_split8"),
+        pytest.param(257, 6, 1, 1024, id="tp4_split4"),
+        pytest.param(513, 6, 1, 1024, id="tp4_split1"),
+    ],
+)
+def test_qsa_sparse_paged_attention_matches_test_reference(
+    num_rows: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> None:
     torch.manual_seed(2)
-    q = torch.randn(3, 4, 16, device="cuda", dtype=torch.bfloat16)
-    k_cache = torch.randn(4, 4, 2, 16, device="cuda", dtype=torch.bfloat16)
-    v_cache = torch.randn_like(k_cache)
-    block_table = torch.tensor([[2, 0], [3, 1]], device="cuda", dtype=torch.int32)
-    token_to_req = torch.tensor([0, 1, 0], device="cuda", dtype=torch.int32)
-    logical_indices = torch.tensor(
-        [[0, 2, 4, 6], [1, 3, 5, -1], [-1, -1, -1, -1]],
+    head_dim = 256
+    num_requests = 2
+    num_selected_pages = 64
+    # Keep the newest page outside the synthetic top-k as causal headroom.
+    num_pages_per_request = num_selected_pages + 1
+    num_cache_blocks = num_requests * num_pages_per_request
+    indexer_budget = 2048
+    indexer_compress_ratio = 4
+    selection_width = indexer_budget + indexer_compress_ratio - 1
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_cache_blocks,
+        page_size,
+        num_kv_heads,
+        2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    block_table = (
+        torch.randperm(num_cache_blocks, device="cuda")
+        .reshape(num_requests, num_pages_per_request)
+        .to(torch.int32)
+    )
+    rows_per_request = math.ceil(num_rows / num_requests)
+    row_indices = torch.arange(num_rows, device="cuda", dtype=torch.int32)
+    token_to_req = row_indices // rows_per_request
+    request_row_counts = torch.tensor(
+        [rows_per_request, num_rows - rows_per_request],
         device="cuda",
         dtype=torch.int32,
     )
+
+    context_length = num_pages_per_request * page_size - 1
+    block_topk = indexer_budget // indexer_compress_ratio
+    compressed_blocks_per_page = page_size // indexer_compress_ratio
+    selection = torch.arange(block_topk, device="cuda")
+    selected_pages = selection % num_selected_pages
+    selected_offsets = selection // num_selected_pages
+    row_shifts = 2 * row_indices.unsqueeze(1)
+    # Eight blocks per page; adjacent rows overlap by six of those eight.
+    selected_offsets = (selected_offsets + row_shifts) % compressed_blocks_per_page
+    block_indices = (selected_pages * compressed_blocks_per_page + selected_offsets).to(
+        torch.int32
+    )
+    rows_within_request = row_indices % rows_per_request
+    query_positions = (
+        context_length - request_row_counts[token_to_req.long()] + rows_within_request
+    ).to(torch.int64)
+    sequence_lengths = torch.full(
+        (num_requests,), context_length, device="cuda", dtype=torch.int32
+    )
+    logical_indices = qsa_ops.expand_qsa_block_indices_cuda(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        indexer_compress_ratio,
+        indexer_budget,
+    )
+    assert logical_indices.shape == (num_rows, selection_width)
     scale = q.shape[-1] ** -0.5
 
     actual = qsa_ops.qsa_sparse_paged_attention(
@@ -307,7 +376,6 @@ def test_qsa_sparse_paged_attention_matches_test_reference() -> None:
         logical_indices,
         block_table,
         token_to_req,
-        scale,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
