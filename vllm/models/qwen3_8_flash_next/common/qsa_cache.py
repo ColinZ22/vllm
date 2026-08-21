@@ -13,6 +13,7 @@ follow the main KV-cache lifecycle.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import ClassVar
 
 import torch
@@ -21,6 +22,8 @@ from torch import nn
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -28,6 +31,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.ops.triton_attention_helpers import find_seq_idx
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -53,14 +57,10 @@ def _logical_positions(
     seq_lens: torch.Tensor,
     token_to_req: torch.Tensor,
     num_tokens: int,
-    arange: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if num_tokens == 0:
         return seq_lens.new_empty((0,), dtype=torch.int64)
-    if arange is None:
-        arange = torch.arange(num_tokens, device=query_start_loc.device)
-    else:
-        arange = arange[:num_tokens]
+    arange = torch.arange(num_tokens, device=query_start_loc.device)
     requests = token_to_req[:num_tokens].long()
     query_lens = torch.diff(query_start_loc)
     within_query = arange - query_start_loc.index_select(0, requests)
@@ -133,6 +133,170 @@ def compressed_qsa_slot_mapping(
     return slots
 
 
+@cache
+def _metadata_launch_pdl() -> bool:
+    return current_platform.is_arch_support_pdl()
+
+
+@triton.jit(do_not_specialize=["num_reqs", "num_mapped_tokens"])
+def _build_qsa_metadata_kernel(
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    common_slot_mapping_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    logical_positions_ptr,
+    compressed_slot_mapping_ptr,
+    block_table_stride_0: tl.constexpr,
+    block_table_stride_1: tl.constexpr,
+    num_reqs,
+    num_mapped_tokens,
+    storage_block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    num_block_table_columns: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    token_idx = tl.program_id(0)
+    mapped = token_idx < num_mapped_tokens
+    # Cudagraph padding still launches one program per buffered token. Point
+    # padded programs at valid search input, then write inert metadata below.
+    search_token_idx = tl.minimum(token_idx, num_mapped_tokens - 1)
+    request_idx = find_seq_idx(
+        query_start_loc_ptr,
+        search_token_idx,
+        num_reqs,
+        1,
+        False,
+    )
+    query_start = tl.load(query_start_loc_ptr + request_idx, mask=mapped, other=0)
+    query_end = tl.load(query_start_loc_ptr + request_idx + 1, mask=mapped, other=0)
+    seq_len = tl.load(seq_lens_ptr + request_idx, mask=mapped, other=0)
+    logical_position = seq_len - (query_end - query_start) + token_idx - query_start
+    logical_position = tl.where(mapped, logical_position, -1)
+
+    tl.store(token_to_req_ptr + token_idx, tl.where(mapped, request_idx, 0))
+    tl.store(logical_positions_ptr + token_idx, logical_position)
+
+    if compress_ratio != 1:
+        compressed_position = tl.maximum(logical_position, 0) // compress_ratio
+        logical_block = compressed_position // storage_block_size
+        valid = (
+            mapped
+            & (logical_position >= 0)
+            & ((logical_position + 1) % compress_ratio == 0)
+            & (logical_block < num_block_table_columns)
+        )
+        physical_block = tl.load(
+            block_table_ptr
+            + request_idx * block_table_stride_0
+            + logical_block * block_table_stride_1,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        valid &= tl.load(common_slot_mapping_ptr + token_idx) >= 0
+        slot = physical_block * storage_block_size + (
+            compressed_position % storage_block_size
+        )
+        tl.store(
+            compressed_slot_mapping_ptr + token_idx,
+            tl.where(valid, slot, -1),
+        )
+
+
+def build_qsa_metadata_triton(
+    common_attn_metadata: CommonAttentionMetadata,
+    token_to_req_buffer: torch.Tensor,
+    logical_positions_buffer: torch.Tensor,
+    slot_mapping_buffer: torch.Tensor,
+    *,
+    storage_block_size: int,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build QSA side-cache metadata with one Triton kernel."""
+    num_tokens = common_attn_metadata.num_actual_tokens
+    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+    token_to_req = token_to_req_buffer[:num_tokens]
+    logical_positions = logical_positions_buffer[:num_tokens]
+    slot_mapping = slot_mapping_buffer[:num_tokens]
+
+    block_table = common_attn_metadata.block_table_tensor
+    _build_qsa_metadata_kernel[(num_tokens,)](
+        common_attn_metadata.query_start_loc,
+        common_attn_metadata.seq_lens,
+        common_attn_metadata.slot_mapping,
+        block_table,
+        token_to_req,
+        logical_positions,
+        slot_mapping,
+        block_table.stride(0),
+        block_table.stride(1),
+        common_attn_metadata.query_start_loc.shape[0] - 1,
+        num_mapped_tokens,
+        storage_block_size,
+        compress_ratio,
+        block_table.shape[1],
+        num_warps=1,
+        launch_pdl=_metadata_launch_pdl(),
+    )
+    if compress_ratio == 1:
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+    return token_to_req, logical_positions, slot_mapping
+
+
+def _build_qsa_metadata_torch(
+    common_attn_metadata: CommonAttentionMetadata,
+    token_to_req_buffer: torch.Tensor,
+    logical_positions_buffer: torch.Tensor,
+    slot_mapping_buffer: torch.Tensor,
+    *,
+    storage_block_size: int,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = common_attn_metadata.num_actual_tokens
+    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+    logical_positions = logical_positions_buffer[:num_tokens]
+
+    token_to_req = common_attn_metadata.token_to_req_indices(token_to_req_buffer)[
+        :num_tokens
+    ]
+    logical_positions[:num_mapped_tokens].copy_(
+        _logical_positions(
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.seq_lens,
+            token_to_req[:num_mapped_tokens],
+            num_mapped_tokens,
+        )
+    )
+    if num_mapped_tokens < num_tokens:
+        logical_positions[num_mapped_tokens:].fill_(-1)
+    if compress_ratio == 1:
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+    else:
+        slot_mapping = compressed_qsa_slot_mapping(
+            common_attn_metadata.block_table_tensor,
+            token_to_req,
+            logical_positions,
+            storage_block_size,
+            compress_ratio,
+            slot_mapping_buffer,
+        )
+        slot_mapping.masked_fill_(
+            common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
+        )
+    return token_to_req, logical_positions, slot_mapping
+
+
+# Resolve the fallback outside the per-step metadata hot path.
+build_qsa_metadata = (
+    build_qsa_metadata_triton if HAS_TRITON else _build_qsa_metadata_torch
+)
+
+
 @dataclass
 class QSAForwardMetadata(AttentionMetadata):
     """Common per-forward metadata for one QSA side cache."""
@@ -171,7 +335,6 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
         )
-        self.arange_buffer = torch.arange(max_tokens, dtype=torch.int64, device=device)
         self.slot_mapping_buffer = torch.empty(
             max_tokens, dtype=torch.int64, device=device
         )
@@ -187,36 +350,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> QSAForwardMetadata:
         del common_prefix_len, fast_build
         num_tokens = common_attn_metadata.num_actual_tokens
-        token_to_req = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_buffer
-        )[:num_tokens]
-        num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-        logical_positions = self.logical_positions_buffer[:num_tokens]
-        logical_positions[:num_mapped_tokens].copy_(
-            _logical_positions(
-                common_attn_metadata.query_start_loc,
-                common_attn_metadata.seq_lens,
-                token_to_req[:num_mapped_tokens],
-                num_mapped_tokens,
-                self.arange_buffer,
-            )
+        token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
+            common_attn_metadata,
+            self.token_to_req_buffer,
+            self.logical_positions_buffer,
+            self.slot_mapping_buffer,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
         )
-        if num_mapped_tokens < num_tokens:
-            logical_positions[num_mapped_tokens:].fill_(-1)
-        if self.compress_ratio == 1:
-            slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
-        else:
-            slot_mapping = compressed_qsa_slot_mapping(
-                common_attn_metadata.block_table_tensor,
-                token_to_req,
-                logical_positions,
-                self.storage_block_size,
-                self.compress_ratio,
-                self.slot_mapping_buffer,
-            )
-            slot_mapping.masked_fill_(
-                common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
-            )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,

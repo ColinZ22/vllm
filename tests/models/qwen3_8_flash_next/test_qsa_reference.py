@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.models.qwen3_8_flash_next.common import qsa_cache
 from vllm.models.qwen3_8_flash_next.common.qsa_cache import QSAMetadataBuilder
 from vllm.models.qwen3_8_flash_next.nvidia import (
     model as _qwen3_8_flash_next_model,  # noqa: F401
@@ -163,23 +164,24 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
+@requires_qsa_kernels
 def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
+    device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 1
     builder.storage_block_size = 64
-    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32)
-    builder.arange_buffer = torch.arange(16, dtype=torch.int64)
-    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64)
-    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64)
-    query_start_loc = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32)
-    token_to_req = torch.tensor([0] * 4 + [1] * 4 + [2] * 4 + [0] * 4)
+    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor([0] * 4 + [1] * 4 + [2] * 4 + [0] * 4, device=device)
     common = SimpleNamespace(
         num_actual_tokens=16,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        seq_lens=torch.tensor([68, 68, 68, 0], dtype=torch.int32),
-        slot_mapping=torch.tensor(list(range(12)) + [-1] * 4),
-        block_table_tensor=torch.empty((4, 0), dtype=torch.int32),
+        seq_lens=torch.tensor([68, 68, 68, 0], dtype=torch.int32, device=device),
+        slot_mapping=torch.tensor(list(range(12)) + [-1] * 4, device=device),
+        block_table_tensor=torch.empty((4, 0), dtype=torch.int32, device=device),
         token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
     )
 
@@ -206,29 +208,90 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     assert metadata.slot_mapping.tolist() == list(range(12)) + [-1] * 4
 
 
+@requires_qsa_kernels
 def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
+    device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 4
     builder.storage_block_size = 16
-    builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32)
-    builder.arange_buffer = torch.arange(8, dtype=torch.int64)
-    builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64)
-    builder.logical_positions_buffer = torch.empty(8, dtype=torch.int64)
-    query_start_loc = torch.tensor([0, 8], dtype=torch.int32)
-    token_to_req = torch.zeros(8, dtype=torch.int32)
+    builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    builder.logical_positions_buffer = torch.empty(8, dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor([0, 8], dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(8, dtype=torch.int32, device=device)
     common = SimpleNamespace(
         num_actual_tokens=8,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        seq_lens=torch.tensor([8], dtype=torch.int32),
-        slot_mapping=torch.full((8,), -1, dtype=torch.int64),
-        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        slot_mapping=torch.full((8,), -1, dtype=torch.int64, device=device),
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32, device=device),
         token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
     )
 
     metadata = builder.build(0, common)
 
     assert metadata.slot_mapping.tolist() == [-1] * 8
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_qsa_triton_metadata_matches_pytorch(
+    compress_ratio: int,
+) -> None:
+    device = torch.device("cuda")
+    num_tokens = 8
+    query_start_loc = torch.tensor([0, 3, 3, 5], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor(
+        [0, 0, 0, 2, 2, 0, 0, 0], dtype=torch.int32, device=device
+    )
+    block_table_storage = torch.tensor(
+        [
+            [4, -1, 8, -1, 12, -1],
+            [1, -1, 2, -1, 3, -1],
+            [7, -1, 9, -1, 11, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    common = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=torch.tensor([10, 0, 20], dtype=torch.int32, device=device),
+        slot_mapping=torch.tensor(
+            [0, 1, -1, 3, 4, -1, -1, -1], dtype=torch.int64, device=device
+        ),
+        block_table_tensor=block_table_storage[:, ::2],
+        token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
+    )
+
+    def make_buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(num_tokens, dtype=torch.int32, device=device),
+            torch.empty(num_tokens, dtype=torch.int64, device=device),
+            torch.empty(num_tokens, dtype=torch.int64, device=device),
+        )
+
+    actual_buffers = make_buffers()
+    actual = qsa_cache.build_qsa_metadata_triton(
+        common,
+        *actual_buffers,
+        storage_block_size=2,
+        compress_ratio=compress_ratio,
+    )
+    actual = tuple(tensor.clone() for tensor in actual)
+
+    expected_buffers = make_buffers()
+    expected = qsa_cache._build_qsa_metadata_torch(
+        common,
+        *expected_buffers,
+        storage_block_size=2,
+        compress_ratio=compress_ratio,
+    )
+
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
 @requires_qsa_kernels
