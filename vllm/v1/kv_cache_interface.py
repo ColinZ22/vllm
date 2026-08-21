@@ -805,6 +805,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
+    def first_spec(self) -> KVCacheSpec:
+        """Return the first spec in the group."""
+        return next(iter(self.kv_cache_specs.values()))
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -856,7 +861,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
-    # NOTE: below util functions are only used by DeepseekV4 for now.
+    # Helpers for cache formats composed of repeated physical layer tuples.
     def get_page_sizes(self) -> list[int]:
         return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
 
@@ -973,7 +978,13 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+        for group in self.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                group_spec = group_spec.first_spec
+            if isinstance(group_spec, MambaSpec):
+                return True
+        return False
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

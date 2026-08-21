@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for contiguous KV cache packing."""
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,18 +10,25 @@ import torch
 
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_config_packed,
+    _get_kv_cache_groups_mamba_hybrid_uniform_groups,
     _get_kv_cache_groups_uniform_groups,
+    _get_packed_kv_cache_layout,
+    _max_memory_usage_bytes_from_groups,
     get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+    group_and_unify_mamba_hybrid_specs,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.attn_utils import _reshape_mamba_kv_cache
 
 
 def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
@@ -151,7 +159,165 @@ def _make_page_group(prefix: str, page_sizes: list[int]) -> KVCacheGroupSpec:
     )
 
 
+def _make_qsa_hybrid_specs() -> dict[str, MambaSpec | FullAttentionSpec]:
+    specs: dict[str, MambaSpec | FullAttentionSpec] = {}
+    for i in range(37):
+        specs[f"gdn.{i}"] = MambaSpec(
+            block_size=256,
+            shapes=((96,),) if i == 0 else ((64,),),
+            dtypes=(torch.uint8,),
+            page_size_padded=128,
+        )
+    for i in range(13):
+        specs[f"qsa.raw.{i}"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.uint8,
+            page_size_padded=256,
+            indexes_kv_by_block_stride=True,
+        )
+        specs[f"qsa.compressed.{i}"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.uint8,
+            page_size_padded=128,
+            compress_ratio=4,
+            indexes_kv_by_block_stride=True,
+        )
+        specs[f"qsa.main.{i}"] = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=8,
+            dtype=torch.uint8,
+            page_size_padded=512,
+            indexes_kv_by_block_stride=True,
+        )
+    return specs
+
+
 class TestInterleavedPacking:
+    def test_qsa_specs_pack_into_one_uniform_group(self):
+        specs = _make_qsa_hybrid_specs()
+        grouped_specs = group_and_unify_mamba_hybrid_specs(specs)
+
+        assert grouped_specs is not None
+        assert len(grouped_specs) == 2
+        groups = _get_kv_cache_groups_mamba_hybrid_uniform_groups(grouped_specs)
+
+        assert len(groups) == 4
+        assert [len(group.layer_names) for group in groups[:3]] == [13, 12, 12]
+        assert all(
+            isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in groups
+        )
+
+        qsa_group = groups[-1]
+        assert len(qsa_group.layer_names) == 39
+        assert {name.split(".")[1] for name in qsa_group.layer_names} == {
+            "raw",
+            "compressed",
+            "main",
+        }
+        assert {
+            qsa_group.kv_cache_spec.kv_cache_specs[name].page_size_bytes
+            for name in qsa_group.layer_names
+        } == {128, 256, 512}
+
+    def test_partial_layer_tuples_are_rejected(self):
+        # Tuples are positional, so a page size that does not cover every layer
+        # would split one layer's caches across groups, i.e. block tables.
+        specs: dict[str, MambaSpec | FullAttentionSpec] = {}
+        for i in range(4):
+            specs[f"gdn.{i}"] = MambaSpec(
+                block_size=16,
+                shapes=((64,),),
+                dtypes=(torch.uint8,),
+                page_size_padded=128,
+            )
+        for i in range(8):
+            specs[f"qsa.main.{i}"] = FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=8,
+                head_size_v=8,
+                dtype=torch.uint8,
+                page_size_padded=512,
+                indexes_kv_by_block_stride=True,
+            )
+            if i % 2 == 0:
+                specs[f"qsa.raw.{i}"] = FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=8,
+                    head_size_v=0,
+                    dtype=torch.uint8,
+                    page_size_padded=256,
+                    indexes_kv_by_block_stride=True,
+                )
+
+        grouped_specs = group_and_unify_mamba_hybrid_specs(specs)
+        assert grouped_specs is not None
+        with pytest.raises(AssertionError):
+            _get_kv_cache_groups_mamba_hybrid_uniform_groups(grouped_specs)
+
+    def test_qsa_pack_requires_block_stride_indexing(self):
+        specs = _make_qsa_hybrid_specs()
+        raw_spec = specs["qsa.raw.0"]
+        assert isinstance(raw_spec, FullAttentionSpec)
+        specs["qsa.raw.0"] = replace(
+            raw_spec,
+            indexes_kv_by_block_stride=False,
+        )
+
+        assert group_and_unify_mamba_hybrid_specs(specs) is None
+
+    def test_qsa_hybrid_dispatch_and_capacity_use_packed_groups(self):
+        config = _mock_vllm_config()
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        config.speculative_config = None
+        config.model_config.max_model_len = 32
+        config.parallel_config.decode_context_parallel_size = 1
+        config.cache_config.mamba_cache_mode = "none"
+
+        groups = get_kv_cache_groups(config, _make_qsa_hybrid_specs())
+        assert len(groups) == 4
+
+        block_stride, _ = _get_packed_kv_cache_layout(groups)
+        assert _max_memory_usage_bytes_from_groups(config, groups) == (block_stride * 5)
+
+        kv_cache_config = get_kv_cache_config_from_groups(
+            config,
+            groups,
+            available_memory=block_stride * 32,
+        )
+        assert kv_cache_config.num_blocks == 32
+        assert {tensor.block_stride for tensor in kv_cache_config.kv_cache_tensors} == {
+            block_stride
+        }
+
+    def test_packed_mamba_views_use_layer_offsets_and_block_stride(self):
+        backing = torch.zeros(3 * 64, dtype=torch.uint8)
+        left = _reshape_mamba_kv_cache(backing, 16, 3, (0, 64))
+        right = _reshape_mamba_kv_cache(backing, 16, 3, (16, 64))
+
+        for block_id in range(3):
+            left[block_id].fill_(block_id + 1)
+            right[block_id].fill_(block_id + 11)
+
+        assert left.stride(0) == right.stride(0) == 64
+        assert left.storage_offset() == 0
+        assert right.storage_offset() == 16
+        for block_id in range(3):
+            assert (left[block_id] == block_id + 1).all()
+            assert (right[block_id] == block_id + 11).all()
+
+        contiguous = _reshape_mamba_kv_cache(backing, 16, 3, None)
+        assert contiguous.shape == (3, 1, 1, 16)
+        assert contiguous.stride(0) == 16
+
     def test_compact_cache_overlays_fp32_state_group(self):
         full_specs = {}
         state_specs = {}

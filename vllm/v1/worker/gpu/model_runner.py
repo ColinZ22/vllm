@@ -62,7 +62,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -510,6 +514,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_num_blocks_per_group = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
             block_sizes.append(spec.block_size)
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`

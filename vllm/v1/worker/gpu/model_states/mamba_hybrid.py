@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
+    get_mamba_group_ids,
     get_mamba_groups,
     preprocess_mamba_align_fused_kernel,
     validate_mamba_state_copy_funcs,
@@ -127,11 +128,7 @@ class MambaHybridModelState(DefaultModelState):
                 and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
                 for spec in mamba_groups
             ), "all mamba groups must share cache scheduling parameters"
-            self._mamba_group_ids = sorted(
-                group_id
-                for group_ids in mamba_groups.values()
-                for group_id in group_ids
-            )
+            self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
             self._mamba_spec = mamba_spec
         return self._mamba_group_ids, self._mamba_spec
 

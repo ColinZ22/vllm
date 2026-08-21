@@ -224,7 +224,10 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _reshape_attention_kv_cache,
+    _reshape_mamba_kv_cache,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -7762,14 +7765,12 @@ class GPUModelRunner(
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size_bytes = kv_cache_spec.page_size_bytes
-                    # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                    # int8 page view per layer; the layer's bind_kv_cache unpacks
-                    # each block's bytes into its conv/ssm state views. Keeping
-                    # one tensor per layer lets the KV connector register it
-                    # without special-casing Mamba.
-                    kv_caches[layer_name] = raw_tensor[
-                        : num_blocks * page_size_bytes
-                    ].view(num_blocks, 1, 1, page_size_bytes)
+                    kv_caches[layer_name] = _reshape_mamba_kv_cache(
+                        raw_tensor,
+                        page_size_bytes,
+                        num_blocks,
+                        packing,
+                    )
                 else:
                     raise NotImplementedError
 

@@ -1585,6 +1585,126 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def group_and_unify_mamba_hybrid_specs(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[UniformTypeKVCacheSpecs] | None:
+    """
+    Group Mamba state and QSA cache specs into separate UniformTypeKVCacheSpecs.
+    Currently, this is only used for Qwen3.8-Flash-Next.
+    """
+    mamba_specs: dict[str, KVCacheSpec] = {}
+    qsa_specs: dict[str, KVCacheSpec] = {}
+    qsa_main_specs: dict[str, KVCacheSpec] = {}
+    qsa_raw_specs: dict[str, KVCacheSpec] = {}
+    qsa_compressed_specs: dict[str, KVCacheSpec] = {}
+    for name, spec in kv_cache_spec.items():
+        if isinstance(spec, MambaSpec):
+            mamba_specs[name] = spec
+        elif type(spec) is MLAAttentionSpec:
+            qsa_specs[name] = spec
+            qsa_compressed_specs[name] = spec
+        elif type(spec) is FullAttentionSpec:
+            if spec.head_size_v == 0:
+                qsa_specs[name] = spec
+                qsa_raw_specs[name] = spec
+            elif spec.head_size_v > 0:
+                qsa_specs[name] = spec
+                qsa_main_specs[name] = spec
+
+    if (
+        not mamba_specs
+        or not qsa_main_specs
+        or not qsa_raw_specs
+        or len(mamba_specs)
+        + len(qsa_main_specs)
+        + len(qsa_raw_specs)
+        + len(qsa_compressed_specs)
+        != len(kv_cache_spec)
+        # Packed pages require backends to address blocks by the runtime stride.
+        or not all(
+            cast(FullAttentionSpec, spec).indexes_kv_by_block_stride
+            for spec in qsa_specs.values()
+        )
+    ):
+        return None
+
+    mamba_uniform = UniformTypeKVCacheSpecs.from_specs(mamba_specs)
+    qsa_uniform = UniformTypeKVCacheSpecs.from_specs(qsa_specs)
+    if mamba_uniform is None or qsa_uniform is None:
+        return None
+
+    # Recurrent groups stay first because hybrid block-transfer protocols
+    # interpret the leading block-table groups as recurrent state groups.
+    return [mamba_uniform, qsa_uniform]
+
+
+def _get_kv_cache_groups_mamba_hybrid_uniform_groups(
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+) -> list[KVCacheGroupSpec]:
+    """Split Mamba and QSA uniform specs into aligned KV cache groups."""
+    assert len(grouped_specs) == 2
+    mamba_spec, qsa_spec = grouped_specs
+    assert all(
+        isinstance(spec, MambaSpec) for spec in mamba_spec.kv_cache_specs.values()
+    )
+
+    mamba_page_sizes = {
+        layer_spec.page_size_bytes for layer_spec in mamba_spec.kv_cache_specs.values()
+    }
+    # Hybrid cache alignment gives all Mamba states one shared page size.
+    assert len(mamba_page_sizes) == 1
+    mamba_layer_tuples = [(layer_name,) for layer_name in mamba_spec.kv_cache_specs]
+
+    qsa_main_layers = [
+        name
+        for name, spec in qsa_spec.kv_cache_specs.items()
+        if type(spec) is FullAttentionSpec and spec.head_size_v > 0
+    ]
+    qsa_raw_layers = [
+        name
+        for name, spec in qsa_spec.kv_cache_specs.items()
+        if type(spec) is FullAttentionSpec and spec.head_size_v == 0
+    ]
+    qsa_compressed_layers = [
+        name
+        for name, spec in qsa_spec.kv_cache_specs.items()
+        if type(spec) is MLAAttentionSpec
+    ]
+    assert len(qsa_main_layers) == len(qsa_raw_layers) == len(qsa_compressed_layers) > 0
+    qsa_layer_tuples = list(zip(qsa_raw_layers, qsa_compressed_layers, qsa_main_layers))
+
+    specs_and_layer_tuples = (
+        (mamba_spec, mamba_layer_tuples),
+        (qsa_spec, qsa_layer_tuples),
+    )
+    group_size = min(len(layer_tuples) for _, layer_tuples in specs_and_layer_tuples)
+    kv_cache_groups: list[KVCacheGroupSpec] = []
+    for uniform_spec, layer_tuples in specs_and_layer_tuples:
+        # Keep each QSA layer's main, raw, and compressed specs together in
+        # the same KV cache group.
+        num_groups = cdiv(len(layer_tuples), group_size)
+        for group_idx in range(num_groups):
+            layer_names = [
+                layer_name
+                for layer_tuple in layer_tuples[group_idx::num_groups]
+                for layer_name in layer_tuple
+            ]
+            group_layer_specs = {
+                layer_name: uniform_spec.kv_cache_specs[layer_name]
+                for layer_name in layer_names
+            }
+            group_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
+            assert group_spec is not None
+            kv_cache_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=layer_names,
+                    kv_cache_spec=group_spec,
+                )
+            )
+
+    return kv_cache_groups
+
+
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1769,6 +1889,12 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif grouped_specs := group_and_unify_mamba_hybrid_specs(kv_cache_spec):
+        # Qwen3.8-Flash-Next case: Mamba states and QSA caches use separate
+        # block tables, while each QSA layer has main, raw, and compressed
+        # caches with different physical formats. Group them into multiple
+        # UniformTypeKVCacheSpecs.
+        return _get_kv_cache_groups_mamba_hybrid_uniform_groups(grouped_specs)
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
@@ -1898,6 +2024,29 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ) and any(
+        isinstance(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).first_spec,
+            MambaSpec,
+        )
+        for group in kv_cache_groups
+    ):
+        # QSA hybrid: each worker uses only its local non-empty groups, whose
+        # layouts alias one packed block slab.
+        local_groups = [group for group in kv_cache_groups if group.layer_names]
+        assert local_groups
+        block_stride, _ = _get_packed_kv_cache_layout(local_groups)
+        blocks_needed = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in local_groups
+        )
+        return block_stride * blocks_needed
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
