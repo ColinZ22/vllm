@@ -45,11 +45,10 @@ from vllm.transformers_utils.configs.qwen3_8_flash_next import (
     Qwen3_8FlashNextTextConfig,
 )
 
-from ..common.hyperconnection import (
-    GatedResidualSimple,
-    HyperConnectionConfig,
-)
+from .hyperconnection import GatedResidualSimple, HyperConnectionConfig
+from .low_latency_gemm import enable_qwen38next_low_latency_gemm
 from .model import (
+    _HC_WEIGHTS_MAPPER,
     _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES,
     Qwen3_8FlashNextDecoderLayer,
     Qwen3_8FlashNextMixtureOfExperts,
@@ -153,7 +152,7 @@ def _make_draft_vllm_config(
     }
 )
 class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -214,15 +213,6 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
-        self.hyper_connection_mixer = self._build_final_mixer(config)
-
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], self.hidden_size * self.hc_count
-        )
-
-    def _build_final_mixer(
-        self, config: Qwen3_8FlashNextTextConfig
-    ) -> GatedResidualSimple:
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
@@ -231,12 +221,13 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        # role="final" (NOT "mtp_*") keeps hc_count identical to the main
-        # model; use_combine=False matches the main model's final mixer.
-        return GatedResidualSimple(
+        self.hyper_connection_mixer = GatedResidualSimple(
             hc_config,
             use_combine=False,
-            role="final",
+            prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], self.hidden_size * self.hc_count
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -283,22 +274,32 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
-        hidden_states = layer(
+        hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
+            prev_block_output=None,
+            prev_injection=None,
             positions=positions,
             input_ids=None,
             query_start_loc=None,
             ngram_context=None,
         )
         if not get_pp_group().is_last_rank:
+            # As in the target model, PP carries a materialized tensor rather
+            # than the delayed hidden/output/injection tuple.
+            hidden_states = layer.mlp_hyper_connection.combine(
+                hidden_states, block_output, injection
+            )
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
         #       for the next draft step (zero extra compute, just kept).
-        multi_hidden = hidden_states
-        sample_hidden_states, _ = self.hyper_connection_mixer.mix(multi_hidden)
+        multi_hidden, sample_hidden_states, _ = (
+            self.hyper_connection_mixer.combine_and_mix(
+                hidden_states, block_output, injection
+            )
+        )
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -331,6 +332,11 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, Qwen3_8FlashNextMixtureOfExpert
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+            "_input_mix_padding",
+        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -369,6 +375,7 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, Qwen3_8FlashNextMixtureOfExpert
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        enable_qwen38next_low_latency_gemm(self, vllm_config.model_config.dtype)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

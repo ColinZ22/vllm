@@ -55,6 +55,22 @@ from vllm.models.qwen3_8_flash_next.nvidia.mtp import _remap_mtp_weight_name
             "layers.0.self_attn.indexer.index_qk_proj.weight",
             None,
         ),
+        # HC merged down-and-injection projection.
+        (
+            "layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+            "layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+            0,
+        ),
+        (
+            "layers.0.attn_hyper_connection.block_inject_weight.weight",
+            "layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight",
+            1,
+        ),
+        (
+            "hyper_connection_mixer.input_mix_weight_down.weight",
+            "hyper_connection_mixer.input_mix_weight_down.weight",
+            None,
+        ),
         (
             "layers.1.ple.ple_embedding.layer_multipliers",
             "layers.1.ple.ple_embedding.layer_multipliers",

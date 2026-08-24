@@ -68,13 +68,18 @@ def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
     model.hidden_size = 4
     model.num_mtp_layers = 1
     model.layers = [
-        lambda **kwargs: kwargs["hidden_states"],
+        lambda **kwargs: (
+            kwargs["hidden_states"],
+            kwargs["hidden_states"],
+            torch.zeros(kwargs["hidden_states"].shape[0], 2),
+        ),
     ]
     model.hyper_connection_mixer = SimpleNamespace(
-        mix=lambda hidden_states: (
-            hidden_states.unflatten(-1, (2, 4)).mean(dim=-2),
+        combine_and_mix=lambda hidden_states, block_output, injection: (
+            hidden_states,
+            hidden_states.unflatten(-1, (2, 4)).mean(-2),
             None,
-        )
+        ),
     )
     multi_hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8)
     pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=True)

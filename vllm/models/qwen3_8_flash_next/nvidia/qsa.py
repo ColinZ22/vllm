@@ -173,7 +173,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         config: Qwen3_8FlashNextTextConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = False,
+        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)

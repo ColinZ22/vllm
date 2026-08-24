@@ -10,11 +10,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -77,11 +73,9 @@ from vllm.transformers_utils.configs.qwen3_8_flash_next import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from ..common.hyperconnection import (
-    GatedResidualSimple,
-    HyperConnectionConfig,
-)
 from ..config import Qwen3_8FlashNextConfig
+from .hyperconnection import GatedResidualSimple, HyperConnectionConfig
+from .low_latency_gemm import enable_qwen38next_low_latency_gemm
 from .ple_layer import Qwen3_8FlashNextPLELayer
 from .qsa import Qwen3_8FlashNextQSAAttention
 
@@ -144,6 +138,21 @@ _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES = [
     "_input_scale",
 ]
 
+# The checkpoint keeps down and injection projections separate; runtime packs
+# them into adjacent logical shards of one MergedColumnParallelLinear.
+_HC_WEIGHTS_MAPPER = WeightsMapper(
+    orig_to_new_stacked={
+        "hyper_connection.input_mix_weight_down.weight": (
+            "hyper_connection.input_mix_weight_down_block_inject.weight",
+            0,
+        ),
+        "hyper_connection.block_inject_weight.weight": (
+            "hyper_connection.input_mix_weight_down_block_inject.weight",
+            1,
+        ),
+    }
+)
+
 
 class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen3.8-Flash-Next HC validation."""
@@ -157,9 +166,6 @@ class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
-        # The current FusedMoEFactory owns its final tensor-parallel
-        # reduction. Do not reduce the result a second time in the HC caller.
-        self.requires_tp_all_reduce = False
 
 
 class Qwen3_8FlashNextDecoderLayer(nn.Module):
@@ -204,7 +210,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                reduce_results=False,
             )
         elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -214,7 +219,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                     model_config=model_config,
                     cache_config=cache_config,
                     quant_config=quant_config,
-                    reduce_results=False,
                     prefix=f"{prefix}.self_attn",
                 )
             else:
@@ -223,7 +227,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                     config=config,
                     layer_id=self.layer_idx,
                     quant_config=quant_config,
-                    reduce_results=False,
                     prefix=f"{prefix}.self_attn",
                 )
         else:
@@ -245,7 +248,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )
 
@@ -259,25 +261,34 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         )
         self.attn_hyper_connection = GatedResidualSimple(
             hc_config,
-            layer_idx=self.layer_idx,
-            role="attn",
+            prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
         self.mlp_hyper_connection = GatedResidualSimple(
             hc_config,
-            layer_idx=self.layer_idx,
-            role="mlp",
+            prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor | None,
+        prev_injection: torch.Tensor | None,
         positions: torch.Tensor,
         *,
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_hc = self.attn_hyper_connection
         if self.ple is not None:
+            # PLE adds directly to the multi-stream state, so pending HC state
+            # must be materialized before the addition.
+            if prev_block_output is not None and prev_injection is not None:
+                hidden_states = attn_hc.combine(
+                    hidden_states, prev_block_output, prev_injection
+                )
+                prev_block_output = prev_injection = None
+
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -287,29 +298,30 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 ngram_context,
             )
 
-        mixed, hc_residual = self.attn_hyper_connection.mix(hidden_states)
+        # Fuse a pending combine with this HC module's mix when possible.
+        if prev_block_output is not None and prev_injection is not None:
+            hidden_states, block_input, injection = attn_hc.combine_and_mix(
+                hidden_states, prev_block_output, prev_injection
+            )
+        else:
+            hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+
         if self.layer_type == "linear_attention":
-            self_attention_output = self.linear_attn(hidden_states=mixed)
+            attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type == "full_attention":
-            self_attention_output = self.self_attn(
-                hidden_states=mixed,
+            attn_out = self.self_attn(
+                hidden_states=block_input,
                 positions=positions,
             )
         else:
             raise ValueError("Invalid layer_type")
-        hidden_states = self_attention_output
-        if get_tensor_model_parallel_world_size() > 1:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, hc_residual)
 
-        mixed, hc_residual = self.mlp_hyper_connection.mix(hidden_states)
-        hidden_states = self.mlp(mixed)
-        if get_tensor_model_parallel_world_size() > 1 and getattr(
-            self.mlp, "requires_tp_all_reduce", True
-        ):
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, hc_residual)
-        return hidden_states
+        mlp_hc = self.mlp_hyper_connection
+        hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+            hidden_states, attn_out, injection
+        )
+        mlp_out = self.mlp(block_input)
+        return hidden_states, mlp_out, injection
 
 
 class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
@@ -374,7 +386,7 @@ class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
     }
 )
 class Qwen3_8FlashNextModel(nn.Module):
-    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper
+    hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -419,7 +431,9 @@ class Qwen3_8FlashNextModel(nn.Module):
                 hc_per_branch_norm=True,
             )
             self.hyper_connection_mixer = GatedResidualSimple(
-                hc_config, use_combine=False, role="final"
+                hc_config,
+                use_combine=False,
+                prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
             self.hyper_connection_mixer = None
@@ -427,7 +441,7 @@ class Qwen3_8FlashNextModel(nn.Module):
         spec_config = vllm_config.speculative_config
         # MTP HC multi-stream outputs: when speculative method=="mtp" and the
         # model uses HC with hc_count>1, retain the pre-final-mixer multi-stream
-        # residual [T, hc_count*H] so the MTP drafter can feed a real
+        # hidden state [T, hc_count*H] so the MTP drafter can feed a real
         # multi-stream backbone hidden on its first step (scheme A). Derived
         # purely from config (NOT node identity) so P/D nodes stay consistent.
         needs_mtp_hidden = (
@@ -470,11 +484,17 @@ class Qwen3_8FlashNextModel(nn.Module):
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
 
+        block_output = None
+        injection = None
+        last_layer = None
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
-            hidden_states = layer(
+            last_layer = layer
+            hidden_states, block_output, injection = layer(
                 hidden_states=hidden_states,
+                prev_block_output=block_output,
+                prev_injection=injection,
                 positions=positions,
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
@@ -495,20 +515,38 @@ class Qwen3_8FlashNextModel(nn.Module):
                     )
                     .flatten(-2)
                 )
+                # Deepstack is an external addition to the materialized
+                # multi-stream state and therefore terminates delayed combine.
+                hidden_states = layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
+                block_output = None
+                injection = None
                 hidden_states = hidden_states + deepstack_embed
 
         if not get_pp_group().is_last_rank:
+            # PP transports one tensor, not the delayed HC tuple. Materialize
+            # with the HC module that produced the pending injection.
+            if last_layer is not None and block_output is not None:
+                hidden_states = last_layer.mlp_hyper_connection.combine(
+                    hidden_states, block_output, injection
+                )
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        # The final mixer consumes the last pending combine and returns both
+        # the sampled single stream and the materialized multi-stream state.
+        final_mixer = self.hyper_connection_mixer
+        assert final_mixer is not None
+        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+            hidden_states, block_output, injection
+        )
         if self._mtp_hidden_buffer is not None:
-            # Capture the pre-final-mixer multi-stream residual
+            # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states)
-        assert self.hyper_connection_mixer is not None
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        return hidden_states
+            num_tokens = multi_hidden.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
@@ -557,6 +595,11 @@ class Qwen3_8FlashNextForCausalLM(
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+            "_input_mix_padding",
+        ],
     }
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"model.language_model.": "model."}
@@ -589,6 +632,7 @@ class Qwen3_8FlashNextForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+        enable_qwen38next_low_latency_gemm(self, self.model_config.dtype)
 
     @staticmethod
     def get_model_state_cls():
@@ -781,7 +825,13 @@ class Qwen3_8FlashNextForConditionalGeneration(
 
     requires_raw_input_tokens = True
 
-    packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping
+    packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+            "_input_mix_padding",
+        ]
+    }
 
     @staticmethod
     def get_model_state_cls():
