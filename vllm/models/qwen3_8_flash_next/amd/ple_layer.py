@@ -132,9 +132,11 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         max_total_tokens: int,
         max_num_reqs: int,
         prefix: str,
+        layer_name: str,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.layer_name = layer_name
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
@@ -310,7 +312,16 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
-        return self.ngram_embedding(ngram_ids).flatten(-2)
+        output = ngram_ids.new_empty(
+            (ngram_ids.shape[0], self.embedding_dim),
+            dtype=self.ngram_embedding.params_dtype,
+        )
+        torch.ops.vllm.qwen3_8_flash_next_amd_ple_ngram_embedding(
+            ngram_ids,
+            output,
+            self.layer_name,
+        )
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -418,6 +429,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             vllm_config.scheduler_config.max_num_batched_tokens,
             vllm_config.scheduler_config.max_num_seqs,
             f"{prefix}.ple_embedding",
+            prefix,
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
@@ -1026,6 +1038,31 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         return gated_value.flatten(-2) + conv_output
 
 
+def qwen3_8_flash_next_amd_ple_ngram_embedding(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the large PLE embedding lookup outside Inductor's FX graph.
+
+    Keeping the embedding weight in ``static_forward_context`` prevents AOT
+    compile-time autotuning from materializing a synthetic copy of the weight.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen3_8FlashNextPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen3.8-Flash-Next PLE owner")
+    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
+def qwen3_8_flash_next_amd_ple_ngram_embedding_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen3_8_flash_next_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1042,6 +1079,14 @@ def qwen3_8_flash_next_ple_short_conv_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_amd_ple_ngram_embedding",
+    op_func=qwen3_8_flash_next_amd_ple_ngram_embedding,
+    mutates_args=["output"],
+    fake_impl=qwen3_8_flash_next_amd_ple_ngram_embedding_fake,
+)
 
 
 direct_register_custom_op(

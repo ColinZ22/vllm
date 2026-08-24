@@ -12,6 +12,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.models.qwen3_8_flash_next.amd import (
     model as _qwen3_8_flash_next_model,  # noqa: F401
 )
+from vllm.models.qwen3_8_flash_next.amd import ple_layer as ple_layer_module
 from vllm.models.qwen3_8_flash_next.amd.indexer_qsa import (
     apply_qsa_rmsnorm,
     apply_qsa_rope,
@@ -41,6 +42,31 @@ def test_rocm_package_exports_amd_implementations() -> None:
     assert Qwen3_8FlashNextForCausalLM.__module__.endswith(".amd.model")
     assert Qwen3_8FlashNextForConditionalGeneration.__module__.endswith(".amd.model")
     assert Qwen3_8FlashNextMTP.__module__.endswith(".amd.mtp")
+
+
+def test_ple_ngram_embedding_custom_op_uses_resident_weight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer_name = "model.layers.0.ple"
+    layer = ple_layer_module.Qwen3_8FlashNextPLELayer.__new__(
+        ple_layer_module.Qwen3_8FlashNextPLELayer
+    )
+    torch.nn.Module.__init__(layer)
+    layer.ple_embedding = torch.nn.Module()
+    layer.ple_embedding.ngram_embedding = torch.nn.Embedding(8, 3)
+    context = SimpleNamespace(no_compile_layers={layer_name: layer})
+    monkeypatch.setattr(ple_layer_module, "get_forward_context", lambda: context)
+
+    ngram_ids = torch.tensor([[0, 1], [2, 3]])
+    output = torch.empty(2, 6)
+    ple_layer_module.qwen3_8_flash_next_amd_ple_ngram_embedding(
+        ngram_ids,
+        output,
+        layer_name,
+    )
+
+    expected = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    torch.testing.assert_close(output, expected)
 
 
 def _qsa_sparse_paged_attention_reference(
