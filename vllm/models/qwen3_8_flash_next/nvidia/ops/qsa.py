@@ -435,38 +435,36 @@ def _store_qsa_rows_kernel(
 
 @triton.jit
 def _compress_qsa_groups_kernel(
-    raw_cache_ptr,
-    rope_cache_ptr,
-    raw_table_ptr,
-    rope_table_ptr,
+    raw_keys_ptr,  # this step's raw key rows, straight from activations
+    raw_positions_ptr,  # this step's per-token positions
+    compressor_state_cache_ptr,  # per-request ring of previous raw keys
+    rope_cache_ptr,  # packed RoPE position tail of the ring
+    compressor_state_table_ptr,
     token_to_req_ptr,
+    query_start_loc_ptr,
     logical_positions_ptr,
     compressed_slots_ptr,
     pooled_ptr,
     first_positions_ptr,
-    stride_raw_block,
-    stride_raw_token,
+    stride_raw_row,
     stride_raw_dim,
+    stride_raw_positions_row,
+    stride_raw_positions_dim,
+    stride_compressor_state_block,
+    stride_compressor_state_token,
+    stride_compressor_state_dim,
     stride_rope_block,
     stride_rope_token,
     stride_rope_dim,
-    stride_raw_table_req,
-    stride_raw_table_page,
-    stride_rope_table_req,
-    stride_rope_table_page,
+    stride_compressor_state_table_req,
     stride_pooled_row,
     stride_pooled_dim,
     stride_positions_row,
     stride_positions_dim,
     num_rows,
-    num_raw_blocks,
-    num_rope_blocks,
-    num_raw_requests,
-    num_rope_requests,
-    RAW_PAGE_SIZE: tl.constexpr,
-    RAW_TABLE_WIDTH: tl.constexpr,
-    ROPE_PAGE_SIZE: tl.constexpr,
-    ROPE_TABLE_WIDTH: tl.constexpr,
+    num_compressor_state_blocks,
+    num_requests,
+    COMPRESSOR_STATE_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -477,40 +475,62 @@ def _compress_qsa_groups_kernel(
     request = tl.load(token_to_req_ptr + row)
     end_position = tl.load(logical_positions_ptr + row)
     compressed_slot = tl.load(compressed_slots_ptr + row)
+    valid_request = (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_row_start = tl.load(
+        query_start_loc_ptr + safe_request, mask=valid_request, other=0
+    )
+    query_row_end = tl.load(
+        query_start_loc_ptr + safe_request + 1, mask=valid_request, other=0
+    )
+    chunk_start_position = end_position - (row - query_row_start)
+    compressor_state_block = tl.load(
+        compressor_state_table_ptr + safe_request * stride_compressor_state_table_req,
+        mask=valid_request,
+        other=-1,
+    )
+    valid_compressor_state_block = (compressor_state_block >= 0) & (
+        compressor_state_block < num_compressor_state_blocks
+    )
     valid_row = (
         (row < num_rows)
-        & (request >= 0)
-        & (request < num_raw_requests)
-        & (request < num_rope_requests)
+        & valid_request
+        & (row >= query_row_start)
+        & (row < query_row_end)
         & (end_position >= COMPRESS_RATIO - 1)
         & (compressed_slot >= 0)
     )
     accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
-    if valid_row:
-        for group_offset in tl.range(0, COMPRESS_RATIO):
-            position = end_position - (COMPRESS_RATIO - 1 - group_offset)
-            logical_page = position // RAW_PAGE_SIZE
-            page_offset = position % RAW_PAGE_SIZE
-            valid = logical_page < RAW_TABLE_WIDTH
-            physical_page = tl.load(
-                raw_table_ptr
-                + request * stride_raw_table_req
-                + tl.minimum(logical_page, RAW_TABLE_WIDTH - 1) * stride_raw_table_page,
-                mask=valid,
-                other=-1,
-            )
-            valid &= (physical_page >= 0) & (physical_page < num_raw_blocks)
-            # physical_page * block stride can overflow int32 for large caches.
-            values = tl.load(
-                raw_cache_ptr
-                + tl.maximum(physical_page, 0).to(tl.int64) * stride_raw_block
-                + page_offset * stride_raw_token
-                + dims * stride_raw_dim,
-                mask=valid & (dims < HEAD_DIM),
-                other=0.0,
-            ).to(tl.float32)
-            accumulator += values
+    # A group can span the compressor-state ring (older members) and this
+    # step's raw rows (members at positions >= chunk_start_position).
+    for group_offset in tl.range(0, COMPRESS_RATIO):
+        position = end_position - (COMPRESS_RATIO - 1 - group_offset)
+        use_raw = position >= chunk_start_position
+        raw_row = query_row_start + position - chunk_start_position
+        raw_values = tl.load(
+            raw_keys_ptr + raw_row * stride_raw_row + dims * stride_raw_dim,
+            mask=valid_row
+            & use_raw
+            & (raw_row >= query_row_start)
+            & (raw_row < query_row_end)
+            & (raw_row < num_rows)
+            & (dims < HEAD_DIM),
+            other=0.0,
+        ).to(tl.float32)
+        compressor_state_values = tl.load(
+            compressor_state_cache_ptr
+            + tl.maximum(compressor_state_block, 0).to(tl.int64)
+            * stride_compressor_state_block
+            + (position % COMPRESSOR_STATE_SIZE) * stride_compressor_state_token
+            + dims * stride_compressor_state_dim,
+            mask=valid_row
+            & ~use_raw
+            & valid_compressor_state_block
+            & (dims < HEAD_DIM),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.where(use_raw, raw_values, compressor_state_values)
 
     tl.store(
         pooled_ptr + row * stride_pooled_row + dims * stride_pooled_dim,
@@ -521,43 +541,45 @@ def _compress_qsa_groups_kernel(
     position_dims = tl.arange(0, 4)
     first_position = end_position - COMPRESS_RATIO + 1
     if LOAD_ROPE_POSITIONS:
-        rope_logical_page = first_position // ROPE_PAGE_SIZE
-        rope_page_offset = first_position % ROPE_PAGE_SIZE
-        valid_rope = valid_row & (rope_logical_page < ROPE_TABLE_WIDTH)
-        rope_physical_page = tl.load(
-            rope_table_ptr
-            + tl.minimum(tl.maximum(request, 0), num_rope_requests - 1)
-            * stride_rope_table_req
-            + tl.minimum(rope_logical_page, ROPE_TABLE_WIDTH - 1)
-            * stride_rope_table_page,
-            mask=valid_rope,
-            other=-1,
-        )
-        valid_rope &= (rope_physical_page >= 0) & (rope_physical_page < num_rope_blocks)
-        rope_values = tl.load(
-            rope_cache_ptr
-            + tl.maximum(rope_physical_page, 0).to(tl.int64) * stride_rope_block
-            + rope_page_offset * stride_rope_token
-            + position_dims * stride_rope_dim,
-            mask=valid_rope & (position_dims < 3),
+        first_from_raw = first_position >= chunk_start_position
+        raw_first_row = query_row_start + first_position - chunk_start_position
+        raw_position_values = tl.load(
+            raw_positions_ptr
+            + raw_first_row * stride_raw_positions_row
+            + position_dims * stride_raw_positions_dim,
+            mask=valid_row
+            & first_from_raw
+            & (raw_first_row >= query_row_start)
+            & (raw_first_row < query_row_end)
+            & (raw_first_row < num_rows)
+            & (position_dims < 3),
             other=0,
         )
-        tl.store(
-            first_positions_ptr
-            + row * stride_positions_row
-            + position_dims * stride_positions_dim,
-            rope_values,
-            mask=(row < num_rows) & (position_dims < 3),
+        compressor_state_position_values = tl.load(
+            rope_cache_ptr
+            + tl.maximum(compressor_state_block, 0).to(tl.int64) * stride_rope_block
+            + (first_position % COMPRESSOR_STATE_SIZE) * stride_rope_token
+            + position_dims * stride_rope_dim,
+            mask=valid_row
+            & ~first_from_raw
+            & valid_compressor_state_block
+            & (position_dims < 3),
+            other=0,
+        )
+        position_values = tl.where(
+            first_from_raw,
+            raw_position_values,
+            compressor_state_position_values,
         )
     else:
-        first_position = tl.where(valid_row, first_position, 0)
-        tl.store(
-            first_positions_ptr
-            + row * stride_positions_row
-            + position_dims * stride_positions_dim,
-            first_position,
-            mask=(row < num_rows) & (position_dims < 3),
-        )
+        position_values = tl.where(valid_row, first_position, 0)
+    tl.store(
+        first_positions_ptr
+        + row * stride_positions_row
+        + position_dims * stride_positions_dim,
+        position_values,
+        mask=(row < num_rows) & (position_dims < 3),
+    )
 
 
 def _validate_mqa(q: torch.Tensor) -> None:
@@ -654,7 +676,7 @@ def expand_qsa_block_indices_cuda(
     token_topk: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Expand compressed blocks and compact the incomplete causal tail."""
+    """Expand compressed blocks and compact the causal tail of the open group."""
 
     if not block_indices.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA CUDA expansion requires Triton")
@@ -955,84 +977,114 @@ def qsa_store_cache_rows(
 
 
 def qsa_compress_groups_with_ratio(
-    raw_cache: torch.Tensor,
-    raw_block_table: torch.Tensor,
+    raw_keys: torch.Tensor,  # this step's raw key rows [rows, 1, head_size]
+    raw_positions: torch.Tensor,  # this step's positions [rows, 1, 3] int64
+    compressor_state_cache: torch.Tensor,
+    compressor_state_block_table: torch.Tensor,
     token_to_req: torch.Tensor,
+    query_start_loc: torch.Tensor,
     logical_positions: torch.Tensor,
     compressed_slots: torch.Tensor,
     compress_ratio: int,
     rope_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pool raw-key groups and load their packed or derived positions."""
+    """Pool completed groups from the compressor-state ring and raw token rows."""
 
-    if not raw_cache.is_cuda or not HAS_TRITON:
+    if not raw_keys.is_cuda or not HAS_TRITON:
         raise RuntimeError("QSA CUDA compression requires Triton")
     rows = token_to_req.numel()
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")
+    if raw_keys.ndim != 3 or raw_keys.shape[:2] != (rows, 1):
+        raise ValueError("QSA raw keys must be [rows, 1, head_size]")
+    if raw_positions.shape != (rows, 1, 3) or raw_positions.dtype != torch.int64:
+        raise ValueError("QSA raw positions must be [rows, 1, 3] int64")
     if logical_positions.shape != (rows,) or compressed_slots.shape != (rows,):
         raise ValueError("QSA compression metadata must match token rows")
-    if raw_cache.ndim != 4 or raw_cache.shape[2] != 1:
-        raise ValueError("QSA raw cache has an invalid shape")
-    if raw_block_table.ndim != 2:
-        raise ValueError("QSA raw compression block table must be rank two")
+    if compressor_state_cache.ndim != 4 or compressor_state_cache.shape[2] != 1:
+        raise ValueError("QSA compressor-state cache has an invalid shape")
+    if (
+        # The ring is wider than one group so speculative rows cannot alias
+        # onto the committed keys of the group still being collected.
+        compressor_state_cache.shape[1] < compress_ratio
+        or compressor_state_cache.shape[3] != raw_keys.shape[2]
+        or compressor_state_cache.dtype != raw_keys.dtype
+    ):
+        raise ValueError(
+            "QSA compressor-state cache does not match the compression layout"
+        )
+    if (
+        compressor_state_block_table.ndim != 2
+        or compressor_state_block_table.shape[1] < 1
+    ):
+        raise ValueError(
+            "QSA compressor-state block table must contain one block per request"
+        )
+    if query_start_loc.ndim != 1 or query_start_loc.shape[0] < 2:
+        raise ValueError("QSA query starts must contain a terminal offset")
+    num_requests = query_start_loc.shape[0] - 1
+    if compressor_state_block_table.shape[0] < num_requests:
+        raise ValueError("QSA compressor-state block table has too few request rows")
     if rope_cache is not None and (
         rope_cache.ndim != 4
-        or rope_cache.shape[:3] != raw_cache.shape[:3]
+        or rope_cache.shape[:3] != compressor_state_cache.shape[:3]
         or rope_cache.shape[3] != 3
         or rope_cache.dtype != torch.int64
     ):
         raise ValueError("QSA packed position view has an invalid shape or dtype")
-    if rows and (not all(raw_cache.shape) or not all(raw_block_table.shape)):
-        raise ValueError("QSA raw cache and block table must be nonempty")
+    if rows and (
+        not all(compressor_state_cache.shape)
+        or not all(compressor_state_block_table.shape)
+    ):
+        raise ValueError("QSA compressor-state cache and block table must be nonempty")
     pooled = torch.empty(
-        (rows, 1, raw_cache.shape[3]), dtype=raw_cache.dtype, device=raw_cache.device
+        (rows, 1, raw_keys.shape[2]),
+        dtype=raw_keys.dtype,
+        device=raw_keys.device,
     )
-    first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_cache.device)
+    first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_keys.device)
     if not rows:
         return pooled, first_positions
     if rope_cache is None:
-        rope_cache = raw_cache
+        rope_cache = compressor_state_cache
         load_rope_positions = False
     else:
         load_rope_positions = True
     _compress_qsa_groups_kernel[(rows,)](
-        raw_cache,
+        raw_keys,
+        raw_positions,
+        compressor_state_cache,
         rope_cache,
-        raw_block_table,
-        raw_block_table,
+        compressor_state_block_table,
         token_to_req,
+        query_start_loc,
         logical_positions,
         compressed_slots,
         pooled,
         first_positions,
-        raw_cache.stride(0),
-        raw_cache.stride(1),
-        raw_cache.stride(3),
+        raw_keys.stride(0),
+        raw_keys.stride(2),
+        raw_positions.stride(0),
+        raw_positions.stride(2),
+        compressor_state_cache.stride(0),
+        compressor_state_cache.stride(1),
+        compressor_state_cache.stride(3),
         rope_cache.stride(0),
         rope_cache.stride(1),
         rope_cache.stride(3),
-        raw_block_table.stride(0),
-        raw_block_table.stride(1),
-        raw_block_table.stride(0),
-        raw_block_table.stride(1),
+        compressor_state_block_table.stride(0),
         pooled.stride(0),
         pooled.stride(2),
         first_positions.stride(0),
         first_positions.stride(1),
         rows,
-        raw_cache.shape[0],
-        rope_cache.shape[0],
-        raw_block_table.shape[0],
-        raw_block_table.shape[0],
-        RAW_PAGE_SIZE=raw_cache.shape[1],
-        RAW_TABLE_WIDTH=raw_block_table.shape[1],
-        ROPE_PAGE_SIZE=rope_cache.shape[1],
-        ROPE_TABLE_WIDTH=raw_block_table.shape[1],
+        compressor_state_cache.shape[0],
+        num_requests,
+        COMPRESSOR_STATE_SIZE=compressor_state_cache.shape[1],
         COMPRESS_RATIO=compress_ratio,
-        HEAD_DIM=raw_cache.shape[3],
+        HEAD_DIM=raw_keys.shape[2],
         LOAD_ROPE_POSITIONS=load_rope_positions,
-        BLOCK_D=triton.next_power_of_2(raw_cache.shape[3]),
+        BLOCK_D=triton.next_power_of_2(raw_keys.shape[2]),
         num_warps=4,
     )
     return pooled, first_positions

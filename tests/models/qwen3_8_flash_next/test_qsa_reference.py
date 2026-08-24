@@ -169,6 +169,7 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 1
+    builder.is_circular_buffer = False
     builder.storage_block_size = 64
     builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32, device=device)
     builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64, device=device)
@@ -208,11 +209,117 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     assert metadata.slot_mapping.tolist() == list(range(12)) + [-1] * 4
 
 
+def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
+    builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.compress_ratio = 4
+    builder.is_circular_buffer = True
+    builder.kv_cache_spec = SimpleNamespace(block_size=4)
+    builder.storage_block_size = 4
+    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32)
+    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64)
+    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 7, 13, 13], dtype=torch.int32)
+    token_to_req = torch.tensor([0] * 7 + [1] * 6 + [0] * 3)
+    block_table = torch.tensor([[1], [0], [2]], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_actual_tokens=16,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=torch.tensor([9, 11, 0], dtype=torch.int32),
+        slot_mapping=torch.full((16,), -1, dtype=torch.int64),
+        block_table_tensor=block_table,
+        token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
+    )
+
+    metadata = builder.build(0, common)
+    expected = [
+        -1,
+        -1,
+        -1,
+        5,
+        6,
+        7,
+        4,
+        -1,
+        -1,
+        3,
+        0,
+        1,
+        2,
+        -1,
+        -1,
+        -1,
+    ]
+
+    assert metadata.slot_mapping.tolist() == expected
+
+
+@pytest.mark.parametrize("chunk_start", list(range(8)))
+def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> None:
+    """A speculative step must not overwrite the open group's committed keys.
+
+    The step stores every row it computes, drafts included, before acceptance
+    is known, while the next step still reads the earlier members of the group
+    being compressed from the ring. A ring sized at the compression ratio makes
+    those rows alias, so a rejected draft silently replaces a committed key.
+    """
+    compress_ratio = 4
+    num_spec = 3
+    capacity = compress_ratio * -(-(compress_ratio + num_spec) // compress_ratio)
+    query_len = num_spec + 1
+
+    slots = qsa_cache.circular_qsa_slot_mapping(
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.zeros(query_len, dtype=torch.int32),
+        torch.arange(chunk_start, chunk_start + query_len),
+        capacity,
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+    )
+
+    committed = torch.arange(chunk_start - chunk_start % compress_ratio, chunk_start)
+    assert set(slots.tolist()).isdisjoint((committed % capacity).tolist())
+
+
+def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStateCache:
+    return qsa_cache.QSAKeyStateCache(
+        head_size=64,
+        dtype=torch.bfloat16,
+        cache_config=SimpleNamespace(block_size=block_size),
+        prefix=f"raw.{block_size}.{compress_ratio}",
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
+        compress_ratio=compress_ratio,
+    )
+
+
+@pytest.mark.parametrize(
+    ("compress_ratio", "num_spec", "expected"),
+    [(4, 0, 4), (4, 1, 8), (4, 3, 8), (4, 4, 8), (4, 5, 12), (2, 3, 6)],
+)
+def test_qsa_ring_capacity_covers_one_speculative_step(
+    compress_ratio: int, num_spec: int, expected: int
+) -> None:
+    """Capacity spans the open group plus one speculative step, in whole groups."""
+    spec = _qsa_key_cache(
+        block_size=48, compress_ratio=compress_ratio
+    ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
+    assert spec.block_size == expected
+
+
+def test_qsa_ring_capacity_must_divide_the_attention_block_size() -> None:
+    """A ring that does not divide the block size inflates the scheduler's LCM."""
+    cache = _qsa_key_cache(block_size=40, compress_ratio=4)
+    with pytest.raises(AssertionError, match="must divide the attention block size"):
+        cache.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=5))
+
+
 @requires_qsa_kernels
 def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 4
+    builder.is_circular_buffer = False
     builder.storage_block_size = 16
     builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
     builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
@@ -529,27 +636,142 @@ def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> 
 
 
 @requires_qsa_kernels
-def test_qsa_cache_store_and_compression_match_test_reference() -> None:
-    rows = torch.arange(64, device="cuda", dtype=torch.float32)
-    rows = rows.reshape(8, 1, 8).to(torch.bfloat16)
-    raw_cache = torch.zeros(2, 4, 1, 8, device="cuda", dtype=torch.bfloat16)
-    slots = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], device="cuda")
-    qsa_ops.qsa_store_cache_rows(raw_cache, slots, rows)
+def test_qsa_streaming_compression_and_compressor_state_store_match_reference() -> None:
+    head_dim = 8
+    current_pairs = [
+        *((0, position) for position in range(2, 9)),
+        *((1, position) for position in range(5, 11)),
+    ]
 
-    block_table = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
-    token_to_req = torch.zeros(2, device="cuda", dtype=torch.int32)
-    logical_positions = torch.tensor([3, 7], device="cuda", dtype=torch.int32)
-    compressed_slots = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    def key_row(request: int, position: int) -> torch.Tensor:
+        return (
+            torch.arange(head_dim, dtype=torch.float32) + request * 1000 + position * 10
+        )
+
+    def position_row(request: int, position: int) -> torch.Tensor:
+        return torch.tensor(
+            [
+                request * 1000 + position,
+                request * 1000 + position + 100,
+                request * 1000 + position + 200,
+            ],
+            dtype=torch.int64,
+        )
+
+    raw_keys = (
+        torch.stack([key_row(request, position) for request, position in current_pairs])
+        .unsqueeze(1)
+        .to(device="cuda", dtype=torch.bfloat16)
+    )
+    raw_positions = (
+        torch.stack(
+            [position_row(request, position) for request, position in current_pairs]
+        )
+        .unsqueeze(1)
+        .to(device="cuda")
+    )
+    token_to_req = torch.tensor(
+        [request for request, _ in current_pairs],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    logical_positions = torch.tensor(
+        [position for _, position in current_pairs],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    query_start_loc = torch.tensor([0, 7, 13], dtype=torch.int32, device="cuda")
+    compressor_state_block_table = torch.tensor(
+        [[1], [0]], dtype=torch.int32, device="cuda"
+    )
+    compressor_state_cache = torch.zeros(
+        2, 4, 1, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    rope_cache = torch.zeros(2, 4, 1, 3, dtype=torch.int64, device="cuda")
+    for request, position, block in ((0, 0, 1), (0, 1, 1), (1, 4, 0)):
+        compressor_state_cache[block, position % 4, 0] = key_row(request, position).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        rope_cache[block, position % 4, 0] = position_row(request, position).to("cuda")
+
+    compressed_slots = torch.full(
+        (len(current_pairs),), -1, dtype=torch.int64, device="cuda"
+    )
+    valid_rows = torch.tensor([1, 5, 9], dtype=torch.int64, device="cuda")
+    compressed_slots[valid_rows] = torch.arange(3, device="cuda")
     pooled, first_positions = qsa_ops.qsa_compress_groups_with_ratio(
-        raw_cache,
-        block_table,
+        raw_keys,
+        raw_positions,
+        compressor_state_cache,
+        compressor_state_block_table,
         token_to_req,
+        query_start_loc,
         logical_positions,
         compressed_slots,
         compress_ratio=4,
+        rope_cache=rope_cache,
+    )
+    pooled_without_rope, scalar_first_positions = (
+        qsa_ops.qsa_compress_groups_with_ratio(
+            raw_keys,
+            raw_positions,
+            compressor_state_cache,
+            compressor_state_block_table,
+            token_to_req,
+            query_start_loc,
+            logical_positions,
+            compressed_slots,
+            compress_ratio=4,
+        )
     )
 
-    expected = rows.reshape(2, 4, 1, 8).float().mean(dim=1).to(torch.bfloat16)
-    expected_positions = torch.tensor([[0, 0, 0], [4, 4, 4]], device="cuda")
-    torch.testing.assert_close(pooled, expected)
-    torch.testing.assert_close(first_positions, expected_positions)
+    groups = [
+        [(0, position) for position in range(0, 4)],
+        [(0, position) for position in range(4, 8)],
+        [(1, position) for position in range(4, 8)],
+    ]
+    expected_pooled = (
+        torch.stack(
+            [
+                torch.stack([key_row(*pair) for pair in group]).mean(dim=0)
+                for group in groups
+            ]
+        )
+        .unsqueeze(1)
+        .to(device="cuda", dtype=torch.bfloat16)
+    )
+    expected_positions = torch.stack(
+        [position_row(0, 0), position_row(0, 4), position_row(1, 4)]
+    ).to("cuda")
+    expected_scalar_positions = torch.tensor(
+        [[0, 0, 0], [4, 4, 4], [4, 4, 4]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+    torch.testing.assert_close(pooled[valid_rows], expected_pooled)
+    torch.testing.assert_close(pooled_without_rope[valid_rows], expected_pooled)
+    torch.testing.assert_close(first_positions[valid_rows], expected_positions)
+    torch.testing.assert_close(
+        scalar_first_positions[valid_rows], expected_scalar_positions
+    )
+
+    compressor_state_slots = torch.tensor(
+        [-1, -1, -1, 5, 6, 7, 4, -1, -1, 3, 0, 1, 2],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    qsa_ops.qsa_store_cache_rows(
+        compressor_state_cache, compressor_state_slots, raw_keys
+    )
+    qsa_ops.qsa_store_cache_rows(rope_cache, compressor_state_slots, raw_positions)
+    for request, positions, block in ((0, range(5, 9), 1), (1, range(7, 11), 0)):
+        for position in positions:
+            torch.testing.assert_close(
+                compressor_state_cache[block, position % 4, 0],
+                key_row(request, position).to(device="cuda", dtype=torch.bfloat16),
+            )
+            torch.testing.assert_close(
+                rope_cache[block, position % 4, 0],
+                position_row(request, position).to("cuda"),
+            )

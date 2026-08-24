@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged side-cache ownership and metadata for Qwen3.8-Flash-Next QSA.
 
-Each QSA layer keeps an uncompressed raw index key and one compressed key.
-MRoPE models pack exact three-axis positions into an integer-typed tail of
-each raw-key page. Text models keep only the key and derive group positions
-from logical positions. The compressed owner uses
-``MLAAttentionSpec.compress_ratio`` so its block table and physical storage
-follow the main KV-cache lifecycle.
+Each QSA layer keeps a fixed circular buffer of raw index keys (the
+compressor state) and one compressed key. MRoPE models pack exact three-axis
+positions beside the raw keys; text models derive group positions from
+logical positions. The compressor state uses one block per request, while
+the compressed owner uses ``MLAAttentionSpec.compress_ratio`` so its block
+table follows the main KV-cache lifecycle. Their physical tensor storage is
+shared by the generic cache-layout planner.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -31,10 +33,11 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.attention.ops.triton_attention_helpers import find_seq_idx
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    FullAttentionSpec,
+    CircularBufferSpec,
     KVCacheSpec,
     MLAAttentionSpec,
 )
@@ -94,11 +97,63 @@ def _logical_to_physical_qsa_slots(
     safe_requests = requests.clamp(0, max(block_table.shape[0] - 1, 0))
     safe_blocks = logical_blocks.clamp(0, max(block_table.shape[1] - 1, 0))
     if not all(block_table.shape):
-        return torch.full_like(positions, -1)
+        return torch.full_like(positions, PAD_SLOT_ID)
     physical_blocks = block_table[safe_requests, safe_blocks].long()
     valid &= physical_blocks >= 0
     slots = physical_blocks * block_size + positions.remainder(block_size)
-    return torch.where(valid, slots, torch.full_like(slots, -1))
+    return torch.where(valid, slots, PAD_SLOT_ID)
+
+
+def circular_qsa_slot_mapping(
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressor_state_size: int,
+    query_start_loc: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map each request to its fixed physical block as a circular token ring."""
+
+    if compressor_state_size <= 0:
+        raise ValueError("QSA circular buffer size must be positive")
+    if block_table.ndim != 2:
+        raise ValueError("QSA block table must be two-dimensional")
+
+    requests = token_to_req.to(device=block_table.device, dtype=torch.long)
+    positions = logical_positions.to(device=block_table.device, dtype=torch.long)
+    if not all(block_table.shape):
+        slots = torch.full_like(positions, PAD_SLOT_ID)
+    else:
+        valid = (requests >= 0) & (requests < block_table.shape[0]) & (positions >= 0)
+        safe_requests = requests.clamp(0, block_table.shape[0] - 1)
+        physical_blocks = block_table[safe_requests, 0].long()
+        valid &= physical_blocks >= 0
+        slots = physical_blocks * compressor_state_size + positions.remainder(
+            compressor_state_size
+        )
+        slots = torch.where(valid, slots, PAD_SLOT_ID)
+
+    if query_start_loc is not None:
+        if query_start_loc.ndim != 1 or query_start_loc.shape[0] < 2:
+            raise ValueError("QSA query starts must contain a terminal offset")
+        query_start_loc = query_start_loc.to(block_table.device)
+        num_requests = query_start_loc.shape[0] - 1
+        safe_requests = requests.clamp(0, num_requests - 1)
+        request_ends = query_start_loc.index_select(0, safe_requests + 1)
+        rows = torch.arange(slots.numel(), device=slots.device)
+        keep = (
+            (requests >= 0)
+            & (requests < num_requests)
+            & (rows + compressor_state_size >= request_ends)
+        )
+        slots = torch.where(keep, slots, PAD_SLOT_ID)
+
+    slots = slots.to(torch.int64)
+    if out is not None:
+        out.fill_(PAD_SLOT_ID)
+        out[: slots.numel()].copy_(slots)
+        return out[: slots.numel()]
+    return slots
 
 
 def compressed_qsa_slot_mapping(
@@ -125,9 +180,9 @@ def compressed_qsa_slot_mapping(
     valid = (logical_positions >= 0) & (
         (logical_positions + 1).remainder(compress_ratio) == 0
     )
-    slots = torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int64)
+    slots = torch.where(valid, slots, PAD_SLOT_ID).to(torch.int64)
     if out is not None:
-        out.fill_(-1)
+        out.fill_(PAD_SLOT_ID)
         out[: slots.numel()].copy_(slots)
         return out[: slots.numel()]
     return slots
@@ -325,11 +380,11 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.compress_ratio = (
-            kv_cache_spec.compress_ratio
-            if isinstance(kv_cache_spec, MLAAttentionSpec)
-            else 1
-        )
+        self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
+        if isinstance(kv_cache_spec, MLAAttentionSpec):
+            self.compress_ratio = kv_cache_spec.compress_ratio
+        else:
+            self.compress_ratio = 1
         self.storage_block_size = kv_cache_spec.storage_block_size
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
@@ -350,14 +405,21 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> QSAForwardMetadata:
         del common_prefix_len, fast_build
         num_tokens = common_attn_metadata.num_actual_tokens
-        token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
-            common_attn_metadata,
-            self.token_to_req_buffer,
-            self.logical_positions_buffer,
-            self.slot_mapping_buffer,
-            storage_block_size=self.storage_block_size,
-            compress_ratio=self.compress_ratio,
-        )
+        if self.is_circular_buffer:
+            # The ring uses its own slot rule (one fixed block per request,
+            # position modulo capacity), so it stays on the torch path.
+            token_to_req, logical_positions, slot_mapping = (
+                self._build_circular_metadata(common_attn_metadata)
+            )
+        else:
+            token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
+                common_attn_metadata,
+                self.token_to_req_buffer,
+                self.logical_positions_buffer,
+                self.slot_mapping_buffer,
+                storage_block_size=self.storage_block_size,
+                compress_ratio=self.compress_ratio,
+            )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -369,6 +431,36 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
+
+    def _build_circular_metadata(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = common_attn_metadata.num_actual_tokens
+        num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+        token_to_req = common_attn_metadata.token_to_req_indices(
+            self.token_to_req_buffer
+        )[:num_tokens]
+        logical_positions = self.logical_positions_buffer[:num_tokens]
+        logical_positions[:num_mapped_tokens].copy_(
+            _logical_positions(
+                common_attn_metadata.query_start_loc,
+                common_attn_metadata.seq_lens,
+                token_to_req[:num_mapped_tokens],
+                num_mapped_tokens,
+            )
+        )
+        if num_mapped_tokens < num_tokens:
+            logical_positions[num_mapped_tokens:].fill_(-1)
+        slot_mapping = circular_qsa_slot_mapping(
+            common_attn_metadata.block_table_tensor,
+            token_to_req,
+            logical_positions,
+            # The ring's own capacity, not the compression ratio.
+            self.kv_cache_spec.block_size,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            out=self.slot_mapping_buffer,
+        )
+        return token_to_req, logical_positions, slot_mapping
 
 
 class QSAStateBackend(AttentionBackend):
@@ -491,9 +583,19 @@ class QSAKeyStateCache(_QSAStateCache):
             self.rope_position_cache = None
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        del vllm_config
-        return FullAttentionSpec(
-            block_size=self.cache_config.block_size,
+        # Hold the open group's committed keys plus every row a speculative
+        # step stores before acceptance is known, rounded up to whole groups so
+        # the ring divides the attention block size (it joins the LCM that sets
+        # the scheduler block size). Anything narrower lets a rejected draft row
+        # overwrite a committed key the next step needs to close the group.
+        span = self.compress_ratio + vllm_config.num_speculative_tokens
+        capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        assert self.cache_config.block_size % capacity == 0, (
+            f"QSA ring capacity {capacity} must divide the attention block "
+            f"size {self.cache_config.block_size}"
+        )
+        return CircularBufferSpec(
+            block_size=capacity,
             num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=0,
@@ -522,5 +624,6 @@ __all__ = [
     "QSAMetadataBuilder",
     "QSAStateBackend",
     "canonical_qsa_rope_positions",
+    "circular_qsa_slot_mapping",
     "compressed_qsa_slot_mapping",
 ]

@@ -1152,6 +1152,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             num_logits = num_draft_tokens_per_req + num_bonus_tokens
+            # combine_sampled_and_draft_tokens places a request's logits rows
+            # at [query_end - num_logits, query_end). Fewer query rows than
+            # that would silently select the preceding request's hidden states.
+            assert (num_scheduled_tokens_np >= num_logits).all()
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])

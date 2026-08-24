@@ -780,6 +780,7 @@ class Qwen3_8FlashNextForCausalLM(
                 shapes=cls.get_ple_mamba_state_shape_from_config(vllm_config),
                 dtypes=cls.get_ple_mamba_state_dtype_from_config(vllm_config),
                 block_size=-1,
+                tp_replicated=True,
             ),
         )
 

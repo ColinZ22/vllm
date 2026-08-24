@@ -464,6 +464,10 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.SHORT_CONV
 
+    @property
+    def is_kv_cache_tp_replicated(self) -> bool:
+        return True
+
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
         return PleShortConvAttentionBackend
 

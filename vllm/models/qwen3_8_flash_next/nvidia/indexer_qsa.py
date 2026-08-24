@@ -119,6 +119,7 @@ class QSAIndexer(nn.Module):
             cache_rope_positions=vllm_config.model_config.uses_mrope,
             prefix=f"{cache_prefix}raw_key_cache",
             cache_config=cache_config,
+            compress_ratio=self.compress_ratio,
             vllm_config=vllm_config,
         )
         self.compressed_key_cache = QSACompressedKeyCache(
@@ -213,24 +214,21 @@ class QSAIndexer(nn.Module):
         rope_position_cache = self.raw_key_cache.rope_position_cache
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
 
-        qsa_store_cache_rows(
-            raw_key_cache,
-            raw_metadata.slot_mapping,
-            token_k[:num_tokens],
-        )
-        if rope_position_cache is not None:
-            position_rows = canonical_qsa_rope_positions(positions)[:num_tokens].to(
-                device=rope_position_cache.device
+        if rope_position_cache is None:
+            position_rows = raw_metadata.logical_positions.view(-1, 1, 1).expand(
+                -1, 1, 3
             )
-            qsa_store_cache_rows(
-                rope_position_cache,
-                raw_metadata.slot_mapping,
-                position_rows,
+        else:
+            position_rows = canonical_qsa_rope_positions(positions)[:num_tokens].to(
+                device=raw_key_cache.device
             )
         pooled, first_positions = qsa_compress_groups_with_ratio(
+            token_k[:num_tokens],
+            position_rows,
             raw_key_cache,
             raw_metadata.block_table,
             raw_metadata.token_to_req,
+            raw_metadata.query_start_loc,
             raw_metadata.logical_positions,
             compressed_metadata.slot_mapping,
             self.compress_ratio,
@@ -242,6 +240,17 @@ class QSAIndexer(nn.Module):
             compressed_metadata.slot_mapping,
             normalized,
         )
+        qsa_store_cache_rows(
+            raw_key_cache,
+            raw_metadata.slot_mapping,
+            token_k[:num_tokens],
+        )
+        if rope_position_cache is not None:
+            qsa_store_cache_rows(
+                rope_position_cache,
+                raw_metadata.slot_mapping,
+                position_rows,
+            )
 
     def _select(
         self,

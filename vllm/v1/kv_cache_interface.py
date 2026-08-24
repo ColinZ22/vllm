@@ -148,6 +148,10 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return True
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -592,6 +596,38 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One block per request holding the raw keys of the token group that
+    is still being compressed.
+
+    ``block_size`` is the ring capacity. It must exceed the compression ratio
+    by the speculative lookahead: a speculative step stores all of its rows,
+    drafts included, before acceptance is known, while the next step still
+    reads the open group's committed keys from the ring.
+    """
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # The ring occupies one block per request for its whole lifetime.
+        del vllm_config
+        return self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        del vllm_config, max_len
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
@@ -672,6 +708,9 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+    # rank holds the full state (e.g. the replicated PLE conv state).
+    tp_replicated: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -803,6 +842,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
 
     @property
     def first_spec(self) -> KVCacheSpec:
