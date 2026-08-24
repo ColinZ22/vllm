@@ -174,6 +174,7 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32, device=device)
     builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64, device=device)
     builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32, device=device)
     token_to_req = torch.tensor([0] * 4 + [1] * 4 + [2] * 4 + [0] * 4, device=device)
     common = SimpleNamespace(
@@ -218,6 +219,7 @@ def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
     builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32)
     builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64)
     builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64)
+    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32)
     query_start_loc = torch.tensor([0, 7, 13, 13], dtype=torch.int32)
     token_to_req = torch.tensor([0] * 7 + [1] * 6 + [0] * 3)
     block_table = torch.tensor([[1], [0], [2]], dtype=torch.int32)
@@ -324,21 +326,26 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
     builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
     builder.logical_positions_buffer = torch.empty(8, dtype=torch.int64, device=device)
-    query_start_loc = torch.tensor([0, 8], dtype=torch.int32, device=device)
-    token_to_req = torch.zeros(8, dtype=torch.int32, device=device)
+    builder.k_start_loc_buffer = torch.empty(4, dtype=torch.int32, device=device)
+    builder.k_work_metadata_buffer = torch.empty(4, 2, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 3, 3, 8], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor(
+        [0, 0, 0, 2, 2, 2, 2, 2], dtype=torch.int32, device=device
+    )
     common = SimpleNamespace(
         num_actual_tokens=8,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([7, 0, 12], dtype=torch.int32, device=device),
         slot_mapping=torch.full((8,), -1, dtype=torch.int64, device=device),
-        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        block_table_tensor=torch.zeros((3, 1), dtype=torch.int32, device=device),
         token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
     )
 
     metadata = builder.build(0, common)
 
     assert metadata.slot_mapping.tolist() == [-1] * 8
+    assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
 
 
 @requires_qsa_kernels

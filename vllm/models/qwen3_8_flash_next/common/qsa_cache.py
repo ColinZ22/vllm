@@ -263,6 +263,80 @@ def _build_qsa_metadata_kernel(
         )
 
 
+@triton.jit
+def _build_k_work_metadata_kernel(
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    k_start_loc_ptr,
+    k_work_metadata_ptr,
+    num_requests,
+    max_num_work,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_REQUESTS: tl.constexpr,
+    BLOCK_WORK: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
+    # Prefix-sum per-request work counts so the fused kernel can map a flat CTA
+    # ID directly to (request, work-within-request).
+    requests = tl.arange(0, BLOCK_REQUESTS)
+    valid = requests < num_requests
+    query_start = tl.load(query_start_loc_ptr + requests, mask=valid, other=0)
+    query_end = tl.load(query_start_loc_ptr + requests + 1, mask=valid, other=0)
+    seq_len = tl.load(seq_lens_ptr + requests, mask=valid, other=0)
+    chunk_start = seq_len - (query_end - query_start)
+    query_len = query_end - query_start
+    num_groups = seq_len // COMPRESS_RATIO - chunk_start // COMPRESS_RATIO
+    num_work = tl.where(query_len > 0, tl.maximum(num_groups, 1), 0)
+    work_end = tl.cumsum(tl.where(valid, num_work, 0), axis=0)
+    tl.store(k_start_loc_ptr, 0)
+    tl.store(
+        k_start_loc_ptr + requests + 1,
+        work_end,
+        mask=valid,
+    )
+    # The binary searches below read prefix sums written by other CTA lanes.
+    tl.debug_barrier()
+
+    # The persistent buffer uses a conservative graph-stable upper bound;
+    # entries beyond the active prefix are explicit sentinels.
+    num_work = tl.sum(tl.where(valid, num_work, 0), axis=0)
+    work_offsets = tl.arange(0, BLOCK_WORK)
+    for work_start in tl.range(0, max_num_work, BLOCK_WORK):
+        work = work_start + work_offsets
+        in_bounds = work < max_num_work
+        active = in_bounds & (work < num_work)
+
+        left = tl.zeros((BLOCK_WORK,), dtype=tl.int32)
+        right = left + num_requests
+        for _ in tl.static_range(SEARCH_STEPS):
+            searching = active & (left < right)
+            mid = (left + right) // 2
+            value = tl.load(k_start_loc_ptr + mid, mask=searching, other=0)
+            move_right = searching & (value <= work)
+            left = tl.where(move_right, mid + 1, left)
+            right = tl.where(searching & ~move_right, mid, right)
+
+        request = left - 1
+        request_work_start = tl.load(
+            k_start_loc_ptr + tl.maximum(request, 0),
+            mask=active,
+            other=0,
+        )
+        work_in_request = work - request_work_start
+        request = tl.where(active, request, -1)
+        work_in_request = tl.where(active, work_in_request, -1)
+        tl.store(
+            k_work_metadata_ptr + work * 2,
+            request,
+            mask=in_bounds,
+        )
+        tl.store(
+            k_work_metadata_ptr + work * 2 + 1,
+            work_in_request,
+            mask=in_bounds,
+        )
+
+
 def build_qsa_metadata_triton(
     common_attn_metadata: CommonAttentionMetadata,
     token_to_req_buffer: torch.Tensor,
@@ -362,6 +436,7 @@ class QSAForwardMetadata(AttentionMetadata):
     query_start_loc: torch.Tensor
     token_to_req: torch.Tensor
     logical_positions: torch.Tensor
+    k_work_metadata: torch.Tensor
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
@@ -396,6 +471,21 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         self.logical_positions_buffer = torch.empty(
             max_tokens, dtype=torch.int64, device=device
         )
+        max_requests = vllm_config.scheduler_config.max_num_seqs
+        self.k_start_loc_buffer = torch.empty(
+            max_requests + 1, dtype=torch.int32, device=device
+        )
+        if not self.is_circular_buffer and self.compress_ratio != 1:
+            max_k_work = (
+                max_tokens + (self.compress_ratio - 1) * max_requests
+            ) // self.compress_ratio
+            self.k_work_metadata_buffer = torch.empty(
+                max_k_work, 2, dtype=torch.int32, device=device
+            )
+        else:
+            self.k_work_metadata_buffer = torch.empty(
+                0, 2, dtype=torch.int32, device=device
+            )
 
     def build(
         self,
@@ -420,6 +510,29 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
                 storage_block_size=self.storage_block_size,
                 compress_ratio=self.compress_ratio,
             )
+        k_work_metadata = self.k_work_metadata_buffer
+        if not self.is_circular_buffer and self.compress_ratio != 1:
+            num_requests = common_attn_metadata.query_start_loc.shape[0] - 1
+            k_start_loc = self.k_start_loc_buffer[: num_requests + 1]
+            max_num_work = (
+                num_tokens + (self.compress_ratio - 1) * num_requests
+            ) // self.compress_ratio
+            k_work_metadata = self.k_work_metadata_buffer[:max_num_work]
+            if max_num_work > 0:
+                block_work = 256
+                _build_k_work_metadata_kernel[(1,)](
+                    common_attn_metadata.query_start_loc,
+                    common_attn_metadata.seq_lens,
+                    k_start_loc,
+                    k_work_metadata,
+                    num_requests,
+                    max_num_work,
+                    COMPRESS_RATIO=self.compress_ratio,
+                    BLOCK_REQUESTS=triton.next_power_of_2(num_requests),
+                    BLOCK_WORK=block_work,
+                    SEARCH_STEPS=(num_requests + 1).bit_length(),
+                    num_warps=4,
+                )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -427,6 +540,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             query_start_loc=common_attn_metadata.query_start_loc,
             token_to_req=token_to_req,
             logical_positions=logical_positions,
+            k_work_metadata=k_work_metadata,
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
