@@ -27,19 +27,22 @@ def __getattr__(name: str) -> Any:
     }:
         from vllm.platforms import current_platform
 
-        if (
-            current_platform.is_rocm()
-            or current_platform.is_xpu()
-            or current_platform.is_tpu()
-        ):
+        if current_platform.is_xpu() or current_platform.is_tpu():
             raise NotImplementedError(
-                "Qwen3.8-Flash-Next currently supports NVIDIA CUDA only"
+                "Qwen3.8-Flash-Next currently supports CUDA and ROCm only"
             )
-        from .nvidia.model import (
-            Qwen3_8FlashNextForCausalLM,
-            Qwen3_8FlashNextForConditionalGeneration,
-        )
-        from .nvidia.mtp import Qwen3_8FlashNextMTP
+        if current_platform.is_rocm():
+            from .amd.model import (
+                Qwen3_8FlashNextForCausalLM,
+                Qwen3_8FlashNextForConditionalGeneration,
+            )
+            from .amd.mtp import Qwen3_8FlashNextMTP
+        else:
+            from .nvidia.model import (
+                Qwen3_8FlashNextForCausalLM,
+                Qwen3_8FlashNextForConditionalGeneration,
+            )
+            from .nvidia.mtp import Qwen3_8FlashNextMTP
 
         return {
             "Qwen3_8FlashNextForCausalLM": Qwen3_8FlashNextForCausalLM,
