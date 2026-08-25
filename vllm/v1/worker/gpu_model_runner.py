@@ -160,6 +160,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
@@ -505,6 +506,17 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+def _get_slot_mapping_mode(kv_cache_spec: KVCacheSpec) -> SlotMappingMode:
+    kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        kv_cache_spec = kv_cache_spec.first_spec
+    if kv_cache_spec_kind == KVCacheSpecKind.MAMBA or isinstance(
+        kv_cache_spec, CircularBufferSpec
+    ):
+        return SlotMappingMode.NONE
+    return SlotMappingMode.TOKEN_TO_KV_SLOT
 
 
 class GPUModelRunner(
@@ -7589,10 +7601,7 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
-                slot_mapping_modes.append(SlotMappingMode.NONE)
-            else:
-                slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            slot_mapping_modes.append(_get_slot_mapping_mode(kv_cache_spec))
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
                 self.vllm_config, max_model_len
             )
