@@ -13,7 +13,7 @@ Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
 
 Typical usage inside a transformer decoder layer::
 
-    self.attn_hc = GatedResidualSimple(hc_config)
+    self.attn_hc = GatedResidual(hc_config)
 
     hidden_states, block_input, injection = self.attn_hc.mix(hidden_states)
     attention_output = attention(block_input)
@@ -47,7 +47,7 @@ from .ops.hc import (
 # ---------------------------------------------------------------------------
 # Gated-residual variant
 # ---------------------------------------------------------------------------
-class GatedResidualSimple(nn.Module):
+class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
     ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
@@ -199,7 +199,7 @@ class GatedResidualSimple(nn.Module):
 
 
 __all__ = [
-    "GatedResidualSimple",
+    "GatedResidual",
     "GroupedGemmaRMSNorm",
     "HyperConnectionConfig",
 ]

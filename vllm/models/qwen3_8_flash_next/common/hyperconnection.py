@@ -8,8 +8,8 @@ Implements the HyperConnection residual scheme proposed in
 The two concrete variants are:
   - ``HyperConnectionBase``  - simple average pooling across hc_count parallel
     streams (equivalent to hyperconnection_average).
-  - ``GatedResidualSimple``  - learnable low-rank gated mixing and injection
-    (gated_residual_simple).
+  - ``GatedResidual``  - learnable low-rank gated mixing and injection
+    (gated_residual).
 
 Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
 (HC outer, HS inner — checkpoint-native layout). The local torch
@@ -17,8 +17,8 @@ implementation consumes the hyper input viewed as ``[..., HC, HS]``.
 
 Typical usage inside a transformer decoder layer::
 
-    self.attn_hc = GatedResidualSimple(hc_config, role="attn")
-    self.mlp_hc = GatedResidualSimple(hc_config, role="mlp")
+    self.attn_hc = GatedResidual(hc_config, role="attn")
+    self.mlp_hc = GatedResidual(hc_config, role="mlp")
 
     hidden_states, residual = self.attn_hc.mix(hidden_states)
     hidden_states = attention(hidden_states)
@@ -137,7 +137,7 @@ class HyperConnectionBase(nn.Module):
 # ---------------------------------------------------------------------------
 # Gated-residual variant
 # ---------------------------------------------------------------------------
-class GatedResidualSimple(HyperConnectionBase):
+class GatedResidual(HyperConnectionBase):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
     ``mix()`` applies GemmaRMSNorm per HC stream and projects through a
@@ -243,7 +243,7 @@ class GatedResidualSimple(HyperConnectionBase):
 
 
 __all__ = [
-    "GatedResidualSimple",
+    "GatedResidual",
     "GroupedGemmaRMSNorm",
     "HyperConnectionBase",
     "HyperConnectionConfig",

@@ -74,7 +74,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen3_8FlashNextConfig
-from .hyperconnection import GatedResidualSimple, HyperConnectionConfig
+from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen38next_low_latency_gemm
 from .ple_layer import Qwen3_8FlashNextPLELayer
 from .qsa import Qwen3_8FlashNextQSAAttention
@@ -259,11 +259,11 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.attn_hyper_connection = GatedResidualSimple(
+        self.attn_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
-        self.mlp_hyper_connection = GatedResidualSimple(
+        self.mlp_hyper_connection = GatedResidual(
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
@@ -420,7 +420,7 @@ class Qwen3_8FlashNextModel(nn.Module):
             ["hidden_states"], intermediate_size
         )
 
-        self.hyper_connection_mixer: GatedResidualSimple | None
+        self.hyper_connection_mixer: GatedResidual | None
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
@@ -430,7 +430,7 @@ class Qwen3_8FlashNextModel(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
             )
-            self.hyper_connection_mixer = GatedResidualSimple(
+            self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),

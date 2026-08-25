@@ -3,14 +3,14 @@
 """Common Qwen3.8-Flash-Next model components."""
 
 from .hyperconnection import (
-    GatedResidualSimple,
+    GatedResidual,
     GroupedGemmaRMSNorm,
     HyperConnectionBase,
     HyperConnectionConfig,
 )
 
 __all__ = [
-    "GatedResidualSimple",
+    "GatedResidual",
     "GroupedGemmaRMSNorm",
     "HyperConnectionBase",
     "HyperConnectionConfig",

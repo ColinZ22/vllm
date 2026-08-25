@@ -45,7 +45,7 @@ from vllm.transformers_utils.configs.qwen3_8_flash_next import (
     Qwen3_8FlashNextTextConfig,
 )
 
-from .hyperconnection import GatedResidualSimple, HyperConnectionConfig
+from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen38next_low_latency_gemm
 from .model import (
     _HC_WEIGHTS_MAPPER,
@@ -221,7 +221,7 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.hyper_connection_mixer = GatedResidualSimple(
+        self.hyper_connection_mixer = GatedResidual(
             hc_config,
             use_combine=False,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),

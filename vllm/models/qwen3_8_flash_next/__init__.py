@@ -5,7 +5,7 @@
 from typing import TYPE_CHECKING, Any
 
 from .common.hyperconnection import (
-    GatedResidualSimple,
+    GatedResidual,
     GroupedGemmaRMSNorm,
     HyperConnectionBase,
     HyperConnectionConfig,
@@ -55,7 +55,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
-    "GatedResidualSimple",
+    "GatedResidual",
     "GroupedGemmaRMSNorm",
     "HyperConnectionBase",
     "HyperConnectionConfig",
