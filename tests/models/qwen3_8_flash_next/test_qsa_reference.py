@@ -210,25 +210,27 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     assert metadata.slot_mapping.tolist() == list(range(12)) + [-1] * 4
 
 
+@requires_qsa_kernels
 def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
+    device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
     builder.compress_ratio = 4
     builder.is_circular_buffer = True
     builder.kv_cache_spec = SimpleNamespace(block_size=4)
     builder.storage_block_size = 4
-    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32)
-    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64)
-    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64)
-    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32)
-    query_start_loc = torch.tensor([0, 7, 13, 13], dtype=torch.int32)
-    token_to_req = torch.tensor([0] * 7 + [1] * 6 + [0] * 3)
-    block_table = torch.tensor([[1], [0], [2]], dtype=torch.int32)
+    builder.token_to_req_buffer = torch.empty(16, dtype=torch.int32, device=device)
+    builder.slot_mapping_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.logical_positions_buffer = torch.empty(16, dtype=torch.int64, device=device)
+    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 7, 13, 13], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor([0] * 7 + [1] * 6 + [0] * 3, device=device)
+    block_table = torch.tensor([[1], [0], [2]], dtype=torch.int32, device=device)
     common = SimpleNamespace(
         num_actual_tokens=16,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        seq_lens=torch.tensor([9, 11, 0], dtype=torch.int32),
-        slot_mapping=torch.full((16,), -1, dtype=torch.int64),
+        seq_lens=torch.tensor([9, 11, 0], dtype=torch.int32, device=device),
+        slot_mapping=torch.full((16,), -1, dtype=torch.int64, device=device),
         block_table_tensor=block_table,
         token_to_req_indices=lambda buffer: buffer.copy_(token_to_req),
     )
@@ -326,7 +328,8 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     builder.token_to_req_buffer = torch.empty(8, dtype=torch.int32, device=device)
     builder.slot_mapping_buffer = torch.empty(8, dtype=torch.int64, device=device)
     builder.logical_positions_buffer = torch.empty(8, dtype=torch.int64, device=device)
-    builder.k_start_loc_buffer = torch.empty(4, dtype=torch.int32, device=device)
+    # Simulate max_num_seqs exceeding the three live requests below.
+    builder.request_capacity = 8
     builder.k_work_metadata_buffer = torch.empty(4, 2, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, 3, 3, 8], dtype=torch.int32, device=device)
     token_to_req = torch.tensor(
@@ -350,16 +353,21 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
 
 @requires_qsa_kernels
 @pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize("num_reqs", [2, 3, 4, 7, 8, 9])
 def test_qsa_triton_metadata_matches_pytorch(
-    compress_ratio: int,
+    compress_ratio: int, num_reqs: int
 ) -> None:
     device = torch.device("cuda")
     num_tokens = 8
-    query_start_loc = torch.tensor([0, 3, 3, 5], dtype=torch.int32, device=device)
-    token_to_req = torch.tensor(
-        [0, 0, 0, 2, 2, 0, 0, 0], dtype=torch.int32, device=device
+    query_start_loc = torch.tensor(
+        [0, 3, *([3] * (num_reqs - 2)), 8], dtype=torch.int32, device=device
     )
-    block_table_storage = torch.tensor(
+    token_to_req = torch.tensor(
+        [0, 0, 0, *([num_reqs - 1] * 5)],
+        dtype=torch.int32,
+        device=device,
+    )
+    block_table_rows = torch.tensor(
         [
             [4, -1, 8, -1, 12, -1],
             [1, -1, 2, -1, 3, -1],
@@ -368,11 +376,17 @@ def test_qsa_triton_metadata_matches_pytorch(
         dtype=torch.int32,
         device=device,
     )
+    block_table_storage = block_table_rows[
+        torch.arange(num_reqs, device=device) % block_table_rows.shape[0]
+    ]
+    seq_lens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+    seq_lens[0] = 10
+    seq_lens[-1] = 20
     common = SimpleNamespace(
         num_actual_tokens=num_tokens,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
-        seq_lens=torch.tensor([10, 0, 20], dtype=torch.int32, device=device),
+        seq_lens=seq_lens,
         slot_mapping=torch.tensor(
             [0, 1, -1, 3, 4, -1, -1, -1], dtype=torch.int64, device=device
         ),
@@ -387,25 +401,97 @@ def test_qsa_triton_metadata_matches_pytorch(
             torch.empty(num_tokens, dtype=torch.int64, device=device),
         )
 
+    max_num_work = (
+        (num_tokens + (compress_ratio - 1) * num_reqs) // compress_ratio
+        if compress_ratio != 1
+        else 0
+    )
+    actual_k_work = (
+        torch.empty(max_num_work, 2, dtype=torch.int32, device=device)
+        if max_num_work
+        else None
+    )
     actual_buffers = make_buffers()
     actual = qsa_cache.build_qsa_metadata_triton(
         common,
         *actual_buffers,
         storage_block_size=2,
         compress_ratio=compress_ratio,
+        k_work_metadata_buffer=actual_k_work,
+        request_capacity=num_reqs,
     )
-    actual = tuple(tensor.clone() for tensor in actual)
 
+    expected_k_work = (
+        torch.empty_like(actual_k_work) if actual_k_work is not None else None
+    )
     expected_buffers = make_buffers()
     expected = qsa_cache._build_qsa_metadata_torch(
         common,
         *expected_buffers,
         storage_block_size=2,
         compress_ratio=compress_ratio,
+        k_work_metadata_buffer=expected_k_work,
+        request_capacity=num_reqs,
     )
 
     for actual_tensor, expected_tensor in zip(actual, expected):
         torch.testing.assert_close(actual_tensor, expected_tensor)
+    if actual_k_work is not None:
+        torch.testing.assert_close(actual_k_work, expected_k_work)
+
+
+@requires_qsa_kernels
+def test_qsa_fused_metadata_matches_pytorch_for_large_padded_prefill() -> None:
+    device = torch.device("cuda")
+    num_mapped_tokens = 4096
+    num_tokens = 4224
+    query_start_loc = torch.tensor(
+        [0, num_mapped_tokens], dtype=torch.int32, device=device
+    )
+    common = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=torch.tensor(
+            [num_mapped_tokens + 32], dtype=torch.int32, device=device
+        ),
+        block_table_tensor=torch.arange(256, dtype=torch.int32, device=device)[None],
+        slot_mapping=torch.tensor(
+            [0] * num_mapped_tokens + [-1] * (num_tokens - num_mapped_tokens),
+            dtype=torch.int64,
+            device=device,
+        ),
+        token_to_req_indices=lambda buffer: buffer.zero_(),
+    )
+
+    def make_buffers() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(num_tokens, dtype=torch.int32, device=device),
+            torch.empty(num_tokens, dtype=torch.int64, device=device),
+            torch.empty(num_tokens, dtype=torch.int64, device=device),
+        )
+
+    max_num_work = (num_tokens + 3) // 4
+    actual_k_work = torch.empty(max_num_work, 2, dtype=torch.int32, device=device)
+    expected_k_work = torch.empty_like(actual_k_work)
+    actual = qsa_cache.build_qsa_metadata_triton(
+        common,
+        *make_buffers(),
+        storage_block_size=8,
+        compress_ratio=4,
+        k_work_metadata_buffer=actual_k_work,
+    )
+    expected = qsa_cache._build_qsa_metadata_torch(
+        common,
+        *make_buffers(),
+        storage_block_size=8,
+        compress_ratio=4,
+        k_work_metadata_buffer=expected_k_work,
+    )
+
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+    torch.testing.assert_close(actual_k_work, expected_k_work)
 
 
 @requires_qsa_kernels

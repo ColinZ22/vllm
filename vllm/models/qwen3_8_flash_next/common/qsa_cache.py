@@ -13,6 +13,7 @@ shared by the generic cache-layout planner.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar
@@ -34,7 +35,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.attention.ops.triton_attention_helpers import find_seq_idx
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
@@ -193,7 +193,16 @@ def _metadata_launch_pdl() -> bool:
     return current_platform.is_arch_support_pdl()
 
 
-@triton.jit(do_not_specialize=["num_reqs", "num_mapped_tokens"])
+@triton.jit(
+    do_not_specialize=[
+        "num_reqs",
+        "num_mapped_tokens",
+        "num_tokens",
+        "max_num_work",
+        "num_search_steps",
+        "work_search_steps",
+    ]
+)
 def _build_qsa_metadata_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
@@ -201,42 +210,81 @@ def _build_qsa_metadata_kernel(
     block_table_ptr,
     token_to_req_ptr,
     logical_positions_ptr,
-    compressed_slot_mapping_ptr,
+    slot_mapping_ptr,
+    k_work_metadata_ptr,
     block_table_stride_0: tl.constexpr,
     block_table_stride_1: tl.constexpr,
     num_reqs,
     num_mapped_tokens,
+    num_tokens,
+    max_num_work,
+    num_search_steps,
+    work_search_steps,
     storage_block_size: tl.constexpr,
     compress_ratio: tl.constexpr,
+    circular_buffer_size: tl.constexpr,
     num_block_table_columns: tl.constexpr,
     launch_pdl: tl.constexpr,
+    TOKEN_BLOCK_SIZE: tl.constexpr,
+    REQUEST_SCAN_SIZE: tl.constexpr,
+    WORK_BLOCK_SIZE: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
-    token_idx = tl.program_id(0)
+    pid = tl.program_id(0)
+    token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
+    store_mask = token_idx < num_tokens
     mapped = token_idx < num_mapped_tokens
-    # Cudagraph padding still launches one program per buffered token. Point
-    # padded programs at valid search input, then write inert metadata below.
     search_token_idx = tl.minimum(token_idx, num_mapped_tokens - 1)
-    request_idx = find_seq_idx(
-        query_start_loc_ptr,
-        search_token_idx,
-        num_reqs,
-        1,
-        False,
-    )
+    request_idx = tl.zeros((TOKEN_BLOCK_SIZE,), tl.int32)
+    # Find the last query start at or before each token. The dynamic loop avoids
+    # compiling a kernel variant for every ceil(log2(num_reqs)).
+    for step in tl.range(0, num_search_steps):
+        candidate = request_idx + (1 << (num_search_steps - step - 1))
+        valid_candidate = candidate < num_reqs
+        candidate_start = tl.load(
+            query_start_loc_ptr + candidate,
+            mask=valid_candidate,
+            other=num_mapped_tokens + 1,
+        )
+        advance = valid_candidate & (candidate_start <= search_token_idx)
+        request_idx = tl.where(advance, candidate, request_idx)
     query_start = tl.load(query_start_loc_ptr + request_idx, mask=mapped, other=0)
     query_end = tl.load(query_start_loc_ptr + request_idx + 1, mask=mapped, other=0)
     seq_len = tl.load(seq_lens_ptr + request_idx, mask=mapped, other=0)
     logical_position = seq_len - (query_end - query_start) + token_idx - query_start
     logical_position = tl.where(mapped, logical_position, -1)
+    tl.store(
+        token_to_req_ptr + token_idx,
+        tl.where(mapped, request_idx, 0),
+        mask=store_mask,
+    )
+    tl.store(
+        logical_positions_ptr + token_idx,
+        logical_position,
+        mask=store_mask,
+    )
 
-    tl.store(token_to_req_ptr + token_idx, tl.where(mapped, request_idx, 0))
-    tl.store(logical_positions_ptr + token_idx, logical_position)
-
-    if compress_ratio != 1:
+    # circular_buffer_size is constexpr, so each builder instance compiles out
+    # the other QSA cache owner's slot-mapping rule.
+    if circular_buffer_size > 0:
+        valid = (
+            mapped
+            & (logical_position >= 0)
+            & (token_idx + circular_buffer_size >= query_end)
+            & (num_block_table_columns > 0)
+        )
+        physical_block = tl.load(
+            block_table_ptr + request_idx * block_table_stride_0,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        slot = physical_block * circular_buffer_size + (
+            logical_position % circular_buffer_size
+        )
+    elif compress_ratio != 1:
         compressed_position = tl.maximum(logical_position, 0) // compress_ratio
         logical_block = compressed_position // storage_block_size
         valid = (
@@ -253,88 +301,78 @@ def _build_qsa_metadata_kernel(
             other=-1,
         )
         valid &= physical_block >= 0
-        valid &= tl.load(common_slot_mapping_ptr + token_idx) >= 0
+        valid &= (
+            tl.load(common_slot_mapping_ptr + token_idx, mask=mapped, other=-1) >= 0
+        )
         slot = physical_block * storage_block_size + (
             compressed_position % storage_block_size
         )
+    if (circular_buffer_size > 0) or (compress_ratio != 1):
         tl.store(
-            compressed_slot_mapping_ptr + token_idx,
+            slot_mapping_ptr + token_idx,
             tl.where(valid, slot, -1),
+            mask=store_mask,
         )
-
-
-@triton.jit
-def _build_k_work_metadata_kernel(
-    query_start_loc_ptr,
-    seq_lens_ptr,
-    k_start_loc_ptr,
-    k_work_metadata_ptr,
-    num_requests,
-    max_num_work,
-    COMPRESS_RATIO: tl.constexpr,
-    BLOCK_REQUESTS: tl.constexpr,
-    BLOCK_WORK: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
-):
-    # Prefix-sum per-request work counts so the fused kernel can map a flat CTA
-    # ID directly to (request, work-within-request).
-    requests = tl.arange(0, BLOCK_REQUESTS)
-    valid = requests < num_requests
-    query_start = tl.load(query_start_loc_ptr + requests, mask=valid, other=0)
-    query_end = tl.load(query_start_loc_ptr + requests + 1, mask=valid, other=0)
-    seq_len = tl.load(seq_lens_ptr + requests, mask=valid, other=0)
-    chunk_start = seq_len - (query_end - query_start)
-    query_len = query_end - query_start
-    num_groups = seq_len // COMPRESS_RATIO - chunk_start // COMPRESS_RATIO
-    num_work = tl.where(query_len > 0, tl.maximum(num_groups, 1), 0)
-    work_end = tl.cumsum(tl.where(valid, num_work, 0), axis=0)
-    tl.store(k_start_loc_ptr, 0)
-    tl.store(
-        k_start_loc_ptr + requests + 1,
-        work_end,
-        mask=valid,
-    )
-    # The binary searches below read prefix sums written by other CTA lanes.
-    tl.debug_barrier()
-
-    # The persistent buffer uses a conservative graph-stable upper bound;
-    # entries beyond the active prefix are explicit sentinels.
-    num_work = tl.sum(tl.where(valid, num_work, 0), axis=0)
-    work_offsets = tl.arange(0, BLOCK_WORK)
-    for work_start in tl.range(0, max_num_work, BLOCK_WORK):
-        work = work_start + work_offsets
+    work_tile_start = pid * WORK_BLOCK_SIZE
+    has_work_tile = work_tile_start < max_num_work
+    if k_work_metadata_ptr is not None and has_work_tile:
+        # Every work CTA builds the request prefix in registers. Recomputing this
+        # small vector lets CTAs write disjoint work tiles without a grid barrier.
+        requests = tl.arange(0, REQUEST_SCAN_SIZE)
+        valid_request = requests < num_reqs
+        request_query_start = tl.load(
+            query_start_loc_ptr + requests, mask=valid_request, other=0
+        )
+        request_query_end = tl.load(
+            query_start_loc_ptr + requests + 1, mask=valid_request, other=0
+        )
+        request_seq_len = tl.load(seq_lens_ptr + requests, mask=valid_request, other=0)
+        request_query_len = request_query_end - request_query_start
+        chunk_start = request_seq_len - request_query_len
+        num_groups = request_seq_len // compress_ratio - chunk_start // compress_ratio
+        # Nonempty requests need one item even without a completed compression
+        # group because work item zero also commits the current raw-K suffix.
+        work_counts = tl.where(request_query_len > 0, tl.maximum(num_groups, 1), 0)
+        work_ends = tl.cumsum(tl.where(valid_request, work_counts, 0), axis=0)
+        total_work = tl.sum(tl.where(valid_request, work_counts, 0), axis=0)
+        work_offsets = tl.arange(0, WORK_BLOCK_SIZE)
+        work = work_tile_start + work_offsets
         in_bounds = work < max_num_work
-        active = in_bounds & (work < num_work)
+        active = in_bounds & (work < total_work)
+        request = tl.zeros((WORK_BLOCK_SIZE,), dtype=tl.int32)
+        # Request zero starts at zero for every active work item. Descending
+        # steps find the last request starting at or before this item.
+        for step_idx in tl.range(0, work_search_steps):
+            step = 1 << (work_search_steps - step_idx - 1)
+            candidate = request + step
+            valid_candidate = candidate < num_reqs
+            candidate_start = tl.gather(work_ends, candidate - 1, 0)
+            advance = active & valid_candidate & (candidate_start <= work)
+            request = tl.where(advance, candidate, request)
 
-        left = tl.zeros((BLOCK_WORK,), dtype=tl.int32)
-        right = left + num_requests
-        for _ in tl.static_range(SEARCH_STEPS):
-            searching = active & (left < right)
-            mid = (left + right) // 2
-            value = tl.load(k_start_loc_ptr + mid, mask=searching, other=0)
-            move_right = searching & (value <= work)
-            left = tl.where(move_right, mid + 1, left)
-            right = tl.where(searching & ~move_right, mid, right)
+        if launch_pdl:
+            # Let the dependent grid start launch setup while these CTAs finish
+            # stores; its gdc_wait still orders access to the completed metadata.
+            tl.extra.cuda.gdc_launch_dependents()
 
-        request = left - 1
-        request_work_start = tl.load(
-            k_start_loc_ptr + tl.maximum(request, 0),
-            mask=active,
-            other=0,
-        )
-        work_in_request = work - request_work_start
-        request = tl.where(active, request, -1)
-        work_in_request = tl.where(active, work_in_request, -1)
+        owner_work_start = tl.gather(work_ends, tl.maximum(request - 1, 0), 0)
+        owner_work_start = tl.where(request == 0, 0, owner_work_start)
+        work_in_request = work - owner_work_start
         tl.store(
             k_work_metadata_ptr + work * 2,
-            request,
+            tl.where(active, request, -1),
             mask=in_bounds,
         )
         tl.store(
             k_work_metadata_ptr + work * 2 + 1,
-            work_in_request,
+            tl.where(active, work_in_request, -1),
             mask=in_bounds,
         )
+
+    else:
+        if launch_pdl:
+            # A dependent grid launches only after every CTA has signaled.
+            tl.extra.cuda.gdc_launch_dependents()
 
 
 def build_qsa_metadata_triton(
@@ -345,16 +383,42 @@ def build_qsa_metadata_triton(
     *,
     storage_block_size: int,
     compress_ratio: int,
+    circular_buffer_size: int = 0,
+    k_work_metadata_buffer: torch.Tensor | None = None,
+    request_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build QSA side-cache metadata with one Triton kernel."""
+    """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
     num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
     token_to_req = token_to_req_buffer[:num_tokens]
     logical_positions = logical_positions_buffer[:num_tokens]
     slot_mapping = slot_mapping_buffer[:num_tokens]
+    num_reqs = common_attn_metadata.query_start_loc.shape[0] - 1
+    assert num_reqs > 0
+
+    if k_work_metadata_buffer is not None:
+        if request_capacity is None:
+            request_capacity = num_reqs
+        assert request_capacity >= num_reqs
+        # Pad for tl.arange while keeping the scan width stable across live batches.
+        request_scan_size = 1 << int(math.ceil(math.log2(request_capacity)))
+        max_num_work = k_work_metadata_buffer.shape[0]
+    else:
+        request_scan_size = 1
+        max_num_work = 0
+
+    if num_tokens == 0 and k_work_metadata_buffer is None:
+        return token_to_req, logical_positions, slot_mapping
 
     block_table = common_attn_metadata.block_table_tensor
-    _build_qsa_metadata_kernel[(num_tokens,)](
+    num_search_steps = int(math.ceil(math.log2(num_reqs)))
+    work_search_steps = int(math.ceil(math.log2(num_reqs)))
+    # The same grid covers token tiles and, for the compressed cache, work tiles.
+    num_token_blocks = cdiv(num_tokens, 128)
+    num_work_blocks = (
+        cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
+    )
+    _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
         common_attn_metadata.query_start_loc,
         common_attn_metadata.seq_lens,
         common_attn_metadata.slot_mapping,
@@ -362,17 +426,26 @@ def build_qsa_metadata_triton(
         token_to_req,
         logical_positions,
         slot_mapping,
+        k_work_metadata_buffer,
         block_table.stride(0),
         block_table.stride(1),
-        common_attn_metadata.query_start_loc.shape[0] - 1,
+        num_reqs,
         num_mapped_tokens,
+        num_tokens,
+        max_num_work,
+        num_search_steps,
+        work_search_steps,
         storage_block_size,
         compress_ratio,
+        circular_buffer_size,
         block_table.shape[1],
-        num_warps=1,
         launch_pdl=_metadata_launch_pdl(),
+        TOKEN_BLOCK_SIZE=128,
+        REQUEST_SCAN_SIZE=request_scan_size,
+        WORK_BLOCK_SIZE=256,
+        num_warps=4,
     )
-    if compress_ratio == 1:
+    if circular_buffer_size == 0 and compress_ratio == 1:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
     return token_to_req, logical_positions, slot_mapping
 
@@ -385,7 +458,11 @@ def _build_qsa_metadata_torch(
     *,
     storage_block_size: int,
     compress_ratio: int,
+    circular_buffer_size: int = 0,
+    k_work_metadata_buffer: torch.Tensor | None = None,
+    request_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del request_capacity
     num_tokens = common_attn_metadata.num_actual_tokens
     num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
     logical_positions = logical_positions_buffer[:num_tokens]
@@ -403,7 +480,16 @@ def _build_qsa_metadata_torch(
     )
     if num_mapped_tokens < num_tokens:
         logical_positions[num_mapped_tokens:].fill_(-1)
-    if compress_ratio == 1:
+    if circular_buffer_size > 0:
+        slot_mapping = circular_qsa_slot_mapping(
+            common_attn_metadata.block_table_tensor,
+            token_to_req,
+            logical_positions,
+            circular_buffer_size,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            out=slot_mapping_buffer,
+        )
+    elif compress_ratio == 1:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
     else:
         slot_mapping = compressed_qsa_slot_mapping(
@@ -416,6 +502,41 @@ def _build_qsa_metadata_torch(
         )
         slot_mapping.masked_fill_(
             common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
+        )
+    if k_work_metadata_buffer is not None:
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        chunk_starts = common_attn_metadata.seq_lens - query_lens
+        num_work_per_request = (
+            common_attn_metadata.seq_lens // compress_ratio
+            - chunk_starts // compress_ratio
+        )
+        num_work_per_request = torch.where(
+            query_lens > 0, num_work_per_request.clamp_min(1), 0
+        )
+        k_start_loc = torch.empty(
+            query_lens.shape[0] + 1,
+            dtype=torch.int32,
+            device=query_lens.device,
+        )
+        k_start_loc[0] = 0
+        torch.cumsum(num_work_per_request, 0, out=k_start_loc[1:])
+        work = torch.arange(
+            k_work_metadata_buffer.shape[0],
+            device=k_work_metadata_buffer.device,
+        )
+        requests = torch.searchsorted(k_start_loc[1:], work, right=True)
+        active = work < k_start_loc[-1]
+        work_in_request = (
+            work - k_start_loc[requests.clamp_max(query_lens.shape[0] - 1)]
+        )
+        k_work_metadata_buffer[:, 0].copy_(
+            torch.where(active, requests, -1).to(torch.int32)
+        )
+        k_work_metadata_buffer[:, 1].copy_(
+            torch.where(active, work_in_request, -1).to(torch.int32)
         )
     return token_to_req, logical_positions, slot_mapping
 
@@ -472,9 +593,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_tokens, dtype=torch.int64, device=device
         )
         max_requests = vllm_config.scheduler_config.max_num_seqs
-        self.k_start_loc_buffer = torch.empty(
-            max_requests + 1, dtype=torch.int32, device=device
-        )
+        self.request_capacity = max_requests
         if not self.is_circular_buffer and self.compress_ratio != 1:
             max_k_work = (
                 max_tokens + (self.compress_ratio - 1) * max_requests
@@ -495,44 +614,29 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> QSAForwardMetadata:
         del common_prefix_len, fast_build
         num_tokens = common_attn_metadata.num_actual_tokens
-        if self.is_circular_buffer:
-            # The ring uses its own slot rule (one fixed block per request,
-            # position modulo capacity), so it stays on the torch path.
-            token_to_req, logical_positions, slot_mapping = (
-                self._build_circular_metadata(common_attn_metadata)
-            )
-        else:
-            token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
-                common_attn_metadata,
-                self.token_to_req_buffer,
-                self.logical_positions_buffer,
-                self.slot_mapping_buffer,
-                storage_block_size=self.storage_block_size,
-                compress_ratio=self.compress_ratio,
-            )
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
         k_work_metadata = self.k_work_metadata_buffer
-        if not self.is_circular_buffer and self.compress_ratio != 1:
+        request_capacity = None
+        if build_k_work:
             num_requests = common_attn_metadata.query_start_loc.shape[0] - 1
-            k_start_loc = self.k_start_loc_buffer[: num_requests + 1]
+            request_capacity = self.request_capacity
             max_num_work = (
                 num_tokens + (self.compress_ratio - 1) * num_requests
             ) // self.compress_ratio
             k_work_metadata = self.k_work_metadata_buffer[:max_num_work]
-            if max_num_work > 0:
-                block_work = 256
-                _build_k_work_metadata_kernel[(1,)](
-                    common_attn_metadata.query_start_loc,
-                    common_attn_metadata.seq_lens,
-                    k_start_loc,
-                    k_work_metadata,
-                    num_requests,
-                    max_num_work,
-                    COMPRESS_RATIO=self.compress_ratio,
-                    BLOCK_REQUESTS=triton.next_power_of_2(num_requests),
-                    BLOCK_WORK=block_work,
-                    SEARCH_STEPS=(num_requests + 1).bit_length(),
-                    num_warps=4,
-                )
+        token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
+            common_attn_metadata,
+            self.token_to_req_buffer,
+            self.logical_positions_buffer,
+            self.slot_mapping_buffer,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata_buffer=k_work_metadata if build_k_work else None,
+            request_capacity=request_capacity,
+        )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -545,36 +649,6 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
-
-    def _build_circular_metadata(
-        self, common_attn_metadata: CommonAttentionMetadata
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        num_tokens = common_attn_metadata.num_actual_tokens
-        num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-        token_to_req = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_buffer
-        )[:num_tokens]
-        logical_positions = self.logical_positions_buffer[:num_tokens]
-        logical_positions[:num_mapped_tokens].copy_(
-            _logical_positions(
-                common_attn_metadata.query_start_loc,
-                common_attn_metadata.seq_lens,
-                token_to_req[:num_mapped_tokens],
-                num_mapped_tokens,
-            )
-        )
-        if num_mapped_tokens < num_tokens:
-            logical_positions[num_mapped_tokens:].fill_(-1)
-        slot_mapping = circular_qsa_slot_mapping(
-            common_attn_metadata.block_table_tensor,
-            token_to_req,
-            logical_positions,
-            # The ring's own capacity, not the compression ratio.
-            self.kv_cache_spec.block_size,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            out=self.slot_mapping_buffer,
-        )
-        return token_to_req, logical_positions, slot_mapping
 
 
 class QSAStateBackend(AttentionBackend):
