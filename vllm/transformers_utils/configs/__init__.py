@@ -105,6 +105,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Qwen3_8FlashNextVisionConfig": (
         "vllm.transformers_utils.configs.qwen3_8_flash_next"
     ),
+    "Qwen4ExpConfig": "vllm.transformers_utils.configs.qwen3_8_flash_next",
+    "Qwen4ExpTextConfig": "vllm.transformers_utils.configs.qwen3_8_flash_next",
+    "Qwen4ExpVisionConfig": "vllm.transformers_utils.configs.qwen3_8_flash_next",
     "Qwen3_5Config": "vllm.transformers_utils.configs.qwen3_5",
     "Qwen3_5TextConfig": "vllm.transformers_utils.configs.qwen3_5",
     "Qwen3_5MoeConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
@@ -200,6 +203,9 @@ __all__ = [
     "Qwen3_8FlashNextConfig",
     "Qwen3_8FlashNextTextConfig",
     "Qwen3_8FlashNextVisionConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
     "Qwen3_5Config",
     "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",

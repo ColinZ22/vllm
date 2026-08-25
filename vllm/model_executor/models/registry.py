@@ -115,6 +115,10 @@ _TEXT_GENERATION_MODELS = {
         "vllm.models.qwen3_8_flash_next",
         "Qwen3_8FlashNextForCausalLM",
     ),
+    "Qwen4ExpForCausalLM": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForCausalLM",
+    ),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),
@@ -599,6 +603,10 @@ _MULTIMODAL_MODELS = {
         "Qwen3_5MoeForConditionalGeneration",
     ),
     "Qwen3_8FlashNextForConditionalGeneration": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForConditionalGeneration",
+    ),
+    "Qwen4ExpForConditionalGeneration": (
         "vllm.models.qwen3_8_flash_next",
         "Qwen3_8FlashNextForConditionalGeneration",
     ),

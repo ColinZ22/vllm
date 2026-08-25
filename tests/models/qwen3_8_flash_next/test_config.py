@@ -12,8 +12,11 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.models.qwen3_8_flash_next.config import (
     Qwen3_8FlashNextConfig,
     Qwen3_8FlashNextTextConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
 )
 from vllm.models.qwen3_8_flash_next.nvidia.model_state import Qwen3_8FlashNextModelState
+from vllm.transformers_utils.config import get_config
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
 )
@@ -199,6 +202,25 @@ def test_qwen3_8_flash_next_text_mtp_override_sets_hc_mult() -> None:
     assert draft_config.model_type == "qwen3_8_flash_next_mtp"
     assert draft_config.hc_mult == draft_config.hc_count == 2
     assert draft_config.to_dict()["hc_mult"] == 2
+
+
+def test_qwen4_exp_checkpoint_names_load_without_overrides(tmp_path) -> None:
+    config = Qwen4ExpConfig(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=_text_config().to_dict(),
+    )
+    config.to_json_file(tmp_path / "config.json", use_diff=False)
+
+    loaded_config = get_config(tmp_path, trust_remote_code=False)
+
+    assert isinstance(loaded_config, Qwen4ExpConfig)
+    assert isinstance(loaded_config.text_config, Qwen4ExpTextConfig)
+    assert loaded_config.architectures == ["Qwen4ExpForConditionalGeneration"]
+
+    draft_config = SpeculativeConfig.hf_config_override(loaded_config)
+
+    assert draft_config.model_type == "qwen3_8_flash_next_mtp"
+    assert draft_config.architectures == ["Qwen3_8FlashNextMTP"]
 
 
 def test_qwen3_8_flash_next_registers_v2_model_state() -> None:

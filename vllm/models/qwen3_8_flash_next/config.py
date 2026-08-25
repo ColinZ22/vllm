@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen3.8-Flash-Next model configuration."""
 
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from transformers import PretrainedConfig
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
@@ -194,7 +194,7 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
 
 class Qwen3_8FlashNextConfig(PretrainedConfig):
     model_type = "qwen3_8_flash_next"
-    sub_configs = {
+    sub_configs: ClassVar[dict[str, type[PretrainedConfig]]] = {
         "vision_config": Qwen3_8FlashNextVisionConfig,
         "text_config": Qwen3_8FlashNextTextConfig,
     }
@@ -247,8 +247,36 @@ class Qwen3_8FlashNextConfig(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
+class Qwen4ExpVisionConfig(Qwen3_8FlashNextVisionConfig):
+    model_type = "qwen4_exp"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+
+class Qwen4ExpTextConfig(Qwen3_8FlashNextTextConfig):
+    model_type = "qwen4_exp_text"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+
+class Qwen4ExpConfig(Qwen3_8FlashNextConfig):
+    model_type = "qwen4_exp"
+    sub_configs: ClassVar[dict[str, type[PretrainedConfig]]] = {
+        "vision_config": Qwen4ExpVisionConfig,
+        "text_config": Qwen4ExpTextConfig,
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+
 __all__ = [
     "Qwen3_8FlashNextConfig",
     "Qwen3_8FlashNextTextConfig",
     "Qwen3_8FlashNextVisionConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
 ]

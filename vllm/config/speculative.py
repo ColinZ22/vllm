@@ -509,7 +509,12 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
             )
-        if hf_config.model_type in {"qwen3_8_flash_next", "qwen3_8_flash_next_text"}:
+        if hf_config.model_type in {
+            "qwen3_8_flash_next",
+            "qwen3_8_flash_next_text",
+            "qwen4_exp",
+            "qwen4_exp_text",
+        }:
             hf_config.model_type = "qwen3_8_flash_next_mtp"
         if hf_config.model_type == "qwen3_8_flash_next_mtp":
             text_config = get_hf_text_config(hf_config)

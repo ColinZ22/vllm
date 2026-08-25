@@ -510,6 +510,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "Qwen3_8FlashNextForCausalLM": _HfExamplesInfo(
         "Qwen/Qwen3.8-Flash-Next", is_available_online=False
     ),
+    "Qwen4ExpForCausalLM": _HfExamplesInfo("", is_available_online=False),
     "MellumForCausalLM": _HfExamplesInfo("JetBrains/Mellum2-12B-A2.5B-Base"),
     "Qwen3NextForCausalLM": _HfExamplesInfo(
         "Qwen/Qwen3-Next-80B-A3B-Instruct",
@@ -1376,6 +1377,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         max_model_len=4096,
     ),
     "Qwen3_8FlashNextForConditionalGeneration": _HfExamplesInfo(
+        "",
+        is_available_online=False,
+    ),
+    "Qwen4ExpForConditionalGeneration": _HfExamplesInfo(
         "",
         is_available_online=False,
     ),
