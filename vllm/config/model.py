@@ -1440,41 +1440,6 @@ class ModelConfig:
     def get_hidden_size(self) -> int:
         return self.model_arch_config.hidden_size
 
-    def get_speculative_hidden_size(self) -> int:
-        """Return the feedback hidden width consumed by a draft model."""
-        hidden_size = int(
-            getattr(
-                self.hf_text_config,
-                "spec_hidden_size",
-                self.get_hidden_size(),
-            )
-        )
-        if hidden_size <= 0:
-            raise ValueError(
-                f"speculative hidden size must be positive, got {hidden_size}"
-            )
-        return hidden_size
-
-    @property
-    def uses_per_group_attn_metadata(self) -> bool:
-        return bool(
-            getattr(
-                self.hf_text_config,
-                "uses_per_group_attn_metadata",
-                False,
-            )
-        )
-
-    @property
-    def spec_decode_returns_tuple(self) -> bool:
-        return bool(
-            getattr(
-                self.hf_text_config,
-                "spec_decode_returns_tuple",
-                False,
-            )
-        )
-
     def get_inputs_embeds_size(self) -> int:
         # The size of inputs_embeds is usually identical to the size
         # of the hidden states, however there are exceptions, such as

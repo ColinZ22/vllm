@@ -191,18 +191,6 @@ class Qwen3_8FlashNextTextConfig(Qwen3NextConfig):
             return 0
         return max(int(self.ngram_size) - 1, 0)
 
-    @property
-    def spec_hidden_size(self) -> int:
-        return int(self.hc_count * self.hidden_size)
-
-    @property
-    def uses_per_group_attn_metadata(self) -> bool:
-        return getattr(self, "indexer_n_heads", None) is not None
-
-    @property
-    def spec_decode_returns_tuple(self) -> bool:
-        return True
-
 
 class Qwen3_8FlashNextConfig(PretrainedConfig):
     model_type = "qwen3_8_flash_next"

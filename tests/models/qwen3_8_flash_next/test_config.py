@@ -53,8 +53,6 @@ def test_qwen3_8_flash_next_framework_defaults_enable_architecture_features() ->
 
     assert config.hc_count == 2
     assert config.output_gate_type == "sigmoid"
-    assert config.spec_hidden_size == 32
-    assert config.spec_decode_returns_tuple
 
 
 def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
@@ -101,7 +99,7 @@ def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
     assert returned_multi_hidden is multi_hidden
 
 
-def test_qwen3_8_flash_next_qsa_enables_per_group_draft_metadata() -> None:
+def test_qwen3_8_flash_next_qsa_preserves_indexer_config() -> None:
     config = _text_config(
         indexer_n_heads=2,
         indexer_kv_heads=1,
@@ -110,7 +108,8 @@ def test_qwen3_8_flash_next_qsa_enables_per_group_draft_metadata() -> None:
         indexer_compress_ratio=4,
     )
 
-    assert config.uses_per_group_attn_metadata
+    assert config.indexer_n_heads == 2
+    assert config.indexer_compress_ratio == 4
 
 
 @pytest.mark.parametrize(
@@ -182,12 +181,24 @@ def test_qwen3_8_flash_next_mtp_override_preserves_text_backbone_layout() -> Non
 
     assert draft_config.model_type == "qwen3_8_flash_next_mtp"
     assert draft_config.architectures == ["Qwen3_8FlashNextMTP"]
+    assert draft_config.hc_mult == draft_config.text_config.hc_count == 2
+    assert draft_config.to_dict()["hc_mult"] == 2
     assert draft_config.n_predict == 1
     assert draft_config.text_config.num_hidden_layers == 2
     assert draft_config.text_config.layer_types == [
         "linear_attention",
         "full_attention",
     ]
+
+
+def test_qwen3_8_flash_next_text_mtp_override_sets_hc_mult() -> None:
+    config = _text_config(architectures=["Qwen3_8FlashNextForCausalLM"])
+
+    draft_config = SpeculativeConfig.hf_config_override(config)
+
+    assert draft_config.model_type == "qwen3_8_flash_next_mtp"
+    assert draft_config.hc_mult == draft_config.hc_count == 2
+    assert draft_config.to_dict()["hc_mult"] == 2
 
 
 def test_qwen3_8_flash_next_registers_v2_model_state() -> None:

@@ -518,8 +518,13 @@ class SpeculativeConfig:
                 "mtp_num_hidden_layers",
                 getattr(text_config, "num_nextn_predict_layers", None),
             )
+            # hc_count is the HC stream multiplier for Qwen MTP feedback.
             hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Qwen3_8FlashNextMTP"]}
+                {
+                    "hc_mult": int(text_config.hc_count),
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen3_8FlashNextMTP"],
+                }
             )
 
         architectures = getattr(hf_config, "architectures", []) or []
@@ -1485,6 +1490,15 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_qwen3_8_flash_next_mtp(self) -> bool:
+        """Return whether Qwen3.8-Flash-Next needs its dedicated proposer."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "qwen3_8_flash_next_mtp"
         )
 
     def use_eagle(self) -> bool:

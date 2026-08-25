@@ -210,6 +210,9 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.qwen3_8_flash_next import (
+    Qwen3_8FlashNextMTPProposer,
+)
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -667,6 +670,7 @@ class GPUModelRunner(
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
                 | Step3p5MTPProposer
+                | Qwen3_8FlashNextMTPProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -703,6 +707,10 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_qwen3_8_flash_next_mtp():
+                self.drafter = Qwen3_8FlashNextMTPProposer(
+                    self.vllm_config, self.device, self
+                )
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2698,15 +2706,20 @@ class GPUModelRunner(
                         Gemma4Proposer,
                         ExtractHiddenStatesProposer,
                     ),
-                ) or getattr(self.drafter, "uses_per_group_attn_metadata", False):
+                ):
                     if cast(Any, self.drafter).kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and (
-                getattr(self.drafter, "uses_per_group_attn_metadata", False)
-                or isinstance(self.drafter, Step3p5MTPProposer)
+            if self.speculative_config and isinstance(
+                self.drafter, Qwen3_8FlashNextMTPProposer
+            ):
+                self.drafter.set_per_group_block_table(
+                    kv_cache_gid, cm.block_table_tensor
+                )
+            elif self.speculative_config and isinstance(
+                self.drafter, Step3p5MTPProposer
             ):
                 cast(Any, self.drafter).set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping

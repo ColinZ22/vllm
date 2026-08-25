@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from copy import copy
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -43,13 +42,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -101,29 +94,13 @@ class SpecDecodeBaseProposer:
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
-        self.hidden_size = self.draft_model_config.get_hidden_size()
+        self.hidden_size = self._get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
-
-        draft_hf_config = self.draft_model_config.hf_config
-
-        self._uses_per_group_attn_metadata = (
-            self.draft_model_config.uses_per_group_attn_metadata
-        )
-        self.spec_decode_returns_tuple = (
-            self.draft_model_config.spec_decode_returns_tuple
-        )
-        if self._uses_per_group_attn_metadata:
-            self.hidden_size = self.draft_model_config.get_speculative_hidden_size()
-
-        self._draft_uses_multiple_kv_groups = False
-        self._per_group_block_tables: dict[int, torch.Tensor] = {}
-        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
-        self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
-        self._per_group_kernel_block_sizes: dict[int, int] = {}
 
         # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
+        draft_hf_config = self.draft_model_config.hf_config
         if hasattr(draft_hf_config, "compress_ratios") and hasattr(
             draft_hf_config, "hc_mult"
         ):
@@ -343,6 +320,10 @@ class SpecDecodeBaseProposer:
 
             self.allowed_attn_types = tuple(rocm_types)
 
+    def _get_hidden_size(self) -> int:
+        """Return the hidden width consumed by the draft model."""
+        return self.draft_model_config.get_hidden_size()
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -425,47 +406,11 @@ class SpecDecodeBaseProposer:
         self,
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
-        slot_mappings_by_layer: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE layers.
 
-        If slot_mapping or slot_mappings_by_layer is provided, copies it into
-        the buffer first.
+        If slot_mapping is provided, copies it into the buffer first.
         """
-        if self.uses_per_group_attn_metadata:
-            per_layer: dict[str, torch.Tensor] = {}
-            for attn_group in self.draft_attn_groups:
-                gid = attn_group.kv_cache_group_id
-                buffer = self._slot_mapping_buffer_for_group(gid)
-                source = None
-                if slot_mappings_by_layer is not None:
-                    for layer_name in attn_group.layer_names:
-                        source = slot_mappings_by_layer.get(layer_name)
-                        if source is not None:
-                            break
-                source = (
-                    source
-                    if source is not None
-                    else (
-                        slot_mapping
-                        if gid == self.kv_cache_gid and slot_mapping is not None
-                        else self._per_group_slot_mappings.get(gid)
-                    )
-                )
-                if source is None:
-                    raise RuntimeError(
-                        f"Missing draft slot mapping for KV cache group {gid}"
-                    )
-                num_actual = min(source.shape[0], num_tokens)
-                if buffer.data_ptr() != source.data_ptr():
-                    buffer[:num_actual].copy_(source[:num_actual])
-                if num_tokens > num_actual:
-                    buffer[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
-                view = buffer[:num_tokens]
-                for layer_name in attn_group.layer_names:
-                    per_layer[layer_name] = view
-            return per_layer
-
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
             self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
@@ -474,38 +419,6 @@ class SpecDecodeBaseProposer:
 
         view = self._slot_mapping_buffer[:num_tokens]
         return {name: view for name in self._draft_attn_layer_names}
-
-    @property
-    def uses_per_group_attn_metadata(self) -> bool:
-        """Whether the drafter needs every scheduler KV cache group."""
-
-        return getattr(self, "_uses_per_group_attn_metadata", False)
-
-    def set_per_group_attn_metadata(
-        self,
-        gid: int,
-        block_table: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Stage one scheduler group's addressing tensors for the drafter."""
-
-        if not self.uses_per_group_attn_metadata:
-            return
-        self._per_group_block_tables[gid] = block_table
-        self._per_group_slot_mappings[gid] = slot_mapping
-
-    def _slot_mapping_buffer_for_group(self, gid: int) -> torch.Tensor:
-        if gid == self.kv_cache_gid:
-            return self._slot_mapping_buffer
-        buffer = self._per_group_slot_mapping_buffers.get(gid)
-        if buffer is None:
-            buffer = torch.empty(
-                self.max_positions,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self._per_group_slot_mapping_buffers[gid] = buffer
-        return buffer
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for the drafter.
@@ -621,7 +534,6 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
-        self._set_primary_common_attn_metadata(common_attn_metadata)
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -876,7 +788,6 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
-        previous_positions = positions
         positions_1d = positions[0] if self.uses_mrope else positions
         if self.uses_mrope:
             out_pos = self.mrope_positions[0, :batch_size]
@@ -916,42 +827,6 @@ class SpecDecodeBaseProposer:
             common_attn_metadata._num_computed_tokens_cpu += 1
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
             common_attn_metadata.seq_lens_cpu_upper_bound += 1
-
-        if self.uses_per_group_attn_metadata:
-            self._per_group_slot_mappings[self.kv_cache_gid] = (
-                common_attn_metadata.slot_mapping
-            )
-            previous_positions_1d = (
-                previous_positions[0] if self.uses_mrope else previous_positions
-            )
-            exceeds_max_model_len = previous_positions_1d + 1 >= self.max_model_len
-            for gid, block_table in self._per_group_block_tables.items():
-                if gid == self.kv_cache_gid:
-                    continue
-                group_block_size = self._per_group_kernel_block_sizes[gid]
-                position_1d = positions[0] if self.uses_mrope else positions
-                logical_blocks = torch.div(
-                    position_1d[:batch_size],
-                    group_block_size,
-                    rounding_mode="floor",
-                ).clamp_max(block_table.shape[1] - 1)
-                physical_blocks = (
-                    block_table[:batch_size]
-                    .gather(
-                        1,
-                        logical_blocks.long().unsqueeze(1),
-                    )
-                    .squeeze(1)
-                )
-                slots = physical_blocks * group_block_size + position_1d[
-                    :batch_size
-                ].remainder(group_block_size)
-                slots.masked_fill_(exceeds_max_model_len[:batch_size], PADDING_SLOT_ID)
-                buffer = self._slot_mapping_buffer_for_group(gid)
-                buffer[:batch_size].copy_(slots)
-                if input_batch_size > batch_size:
-                    buffer[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
-                self._per_group_slot_mappings[gid] = buffer[:batch_size]
 
         return positions
 
@@ -1130,12 +1005,6 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
-        if self.uses_per_group_attn_metadata:
-            return self._build_multi_group_attn_metadata(
-                common_attn_metadata,
-                draft_index,
-            )
-
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -1147,148 +1016,14 @@ class SpecDecodeBaseProposer:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
 
-    def _build_group_slot_mapping(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        block_table: torch.Tensor,
-        gid: int,
-    ) -> torch.Tensor:
-        """Rebuild packed slots against one draft cache group."""
-
-        num_tokens = common_attn_metadata.num_actual_tokens
-        num_reqs = common_attn_metadata.num_reqs
-        if num_tokens > self.max_positions:
-            raise ValueError("Draft batch exceeds slot-mapping buffers")
-        if block_table.shape[0] < num_reqs or block_table.shape[1] == 0:
-            raise ValueError(f"Invalid block table for draft KV cache group {gid}")
-
-        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
-        query_lens = torch.diff(query_start_loc).long()
-        num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-        request_indices = torch.repeat_interleave(
-            torch.arange(num_reqs, device=query_start_loc.device),
-            query_lens,
-            output_size=num_mapped_tokens,
-        )
-        row_indices = self.arange[:num_mapped_tokens].to(torch.long)
-        within_query = (
-            row_indices - query_start_loc.index_select(0, request_indices).long()
-        )
-        logical_positions = (
-            common_attn_metadata.seq_lens[:num_reqs]
-            .index_select(0, request_indices)
-            .long()
-            - query_lens.index_select(0, request_indices)
-            + within_query
-        )
-
-        block_size = self._per_group_kernel_block_sizes[gid]
-        logical_blocks = torch.div(
-            logical_positions.clamp_min(0),
-            block_size,
-            rounding_mode="floor",
-        )
-        valid = (
-            (logical_positions >= 0)
-            & (logical_positions < self.max_model_len)
-            & (logical_blocks < block_table.shape[1])
-        )
-        safe_blocks = logical_blocks.clamp_max(block_table.shape[1] - 1)
-        physical_blocks = block_table[:num_reqs][
-            request_indices,
-            safe_blocks,
-        ].long()
-        valid &= physical_blocks >= 0
-        slots = physical_blocks * block_size + logical_positions.remainder(block_size)
-
-        buffer = self._slot_mapping_buffer_for_group(gid)
-        buffer[:num_mapped_tokens].copy_(
-            torch.where(valid, slots, torch.full_like(slots, PADDING_SLOT_ID))
-        )
-        if num_mapped_tokens < num_tokens:
-            buffer[num_mapped_tokens:num_tokens].fill_(PADDING_SLOT_ID)
-        return buffer[:num_tokens]
-
-    def _build_multi_group_attn_metadata(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        draft_index: int,
-    ) -> tuple[list[object], dict[str, object]]:
-        """Build draft metadata with each cache group's own block table."""
-
-        per_group_attn_metadata: list[object] = []
-        per_layer_attn_metadata: dict[str, object] = {}
-        common_by_gid: dict[int, CommonAttentionMetadata] = {}
-        num_reqs = common_attn_metadata.num_reqs
-        num_tokens = common_attn_metadata.num_actual_tokens
-
-        for attn_group in self.draft_attn_groups:
-            gid = attn_group.kv_cache_group_id
-            group_common = common_by_gid.get(gid)
-            if group_common is None:
-                block_table = self._per_group_block_tables.get(gid)
-                if block_table is None:
-                    if gid != self.kv_cache_gid:
-                        raise RuntimeError(
-                            f"Missing draft block table for KV cache group {gid}"
-                        )
-                    block_table = common_attn_metadata.block_table_tensor
-
-                group_common = copy(common_attn_metadata)
-                group_common.block_table_tensor = block_table[:num_reqs]
-                if gid == self.kv_cache_gid:
-                    group_common.slot_mapping = common_attn_metadata.slot_mapping[
-                        :num_tokens
-                    ]
-                else:
-                    group_common.slot_mapping = self._build_group_slot_mapping(
-                        common_attn_metadata,
-                        group_common.block_table_tensor,
-                        gid,
-                    )
-                self._per_group_slot_mappings[gid] = group_common.slot_mapping
-                common_by_gid[gid] = group_common
-
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=group_common,
-                draft_index=draft_index,
-            )
-            per_group_attn_metadata.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-
-        return per_group_attn_metadata, per_layer_attn_metadata
-
-    def _set_primary_common_attn_metadata(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-    ) -> None:
-        """Route shared draft metadata through the main KV cache group."""
-
-        if not self.uses_per_group_attn_metadata:
-            return
-        block_table = self._per_group_block_tables.get(self.kv_cache_gid)
-        slot_mapping = self._per_group_slot_mappings.get(self.kv_cache_gid)
-        if block_table is None or slot_mapping is None:
-            raise RuntimeError("Missing main draft KV cache addressing metadata")
-        common_attn_metadata.block_table_tensor = block_table[
-            : common_attn_metadata.num_reqs
-        ]
-        common_attn_metadata.slot_mapping = slot_mapping[
-            : common_attn_metadata.num_actual_tokens
-        ]
-
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":
             # These models return separate hidden states for logits and for
             # feedback into the next draft step.
             architectures = self.draft_model_config.hf_config.architectures or []
             return bool(
-                {
-                    "DeepSeekMTPModel",
-                    "KimiK3MTPModel",
-                }.intersection(architectures)
-            ) or getattr(self, "spec_decode_returns_tuple", False)
+                {"DeepSeekMTPModel", "KimiK3MTPModel"}.intersection(architectures)
+            )
         return self.method not in ("mtp", "draft_model", "dflash")
 
     def prepare_next_token_ids_cpu(
@@ -1927,10 +1662,7 @@ class SpecDecodeBaseProposer:
                 and slot_mappings is not None
                 and next(iter(self._draft_attn_layer_names)) in slot_mappings
             ):
-                slot_mapping_dict = self._get_slot_mapping(
-                    num_input_tokens,
-                    slot_mappings_by_layer=slot_mappings,
-                )
+                slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
             else:
                 slot_mapping_dict = slot_mappings or {}
 
@@ -1981,9 +1713,6 @@ class SpecDecodeBaseProposer:
         same AttentionMetadata.
         May extend to multiple AttentionMetadata in the future.
         """
-        if self.uses_per_group_attn_metadata:
-            return
-
         kv_cache_groups: dict[str, int] = {}
         for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             for layer_name in kv_cache_group.layer_names:
@@ -2009,13 +1738,6 @@ class SpecDecodeBaseProposer:
         Initialize AttentionGroups for draft layers using kv_cache_config.
         Called from the model runner's initialize_metadata_builders.
         """
-        if self.uses_per_group_attn_metadata:
-            self._initialize_multi_group_attn_backends(
-                kv_cache_config,
-                kernel_block_sizes,
-            )
-            return
-
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
@@ -2082,115 +1804,6 @@ class SpecDecodeBaseProposer:
                 .kv_cache_spec.block_size
             )
         logger.debug("Using block size %d for drafting layers", self.block_size)
-
-    def _initialize_multi_group_attn_backends(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kernel_block_sizes: list[int] | None,
-    ) -> None:
-        """Initialize every draft cache owner in its scheduler group."""
-
-        all_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config,
-            AttentionLayerBase,  # type: ignore[type-abstract]
-        )
-        layer_to_gid: dict[str, int] = {}
-        layer_to_spec: dict[str, KVCacheSpec] = {}
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            group_spec = group.kv_cache_spec
-            group_kernel_block_size = (
-                kernel_block_sizes[gid]
-                if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
-                else group_spec.block_size
-            )
-            self._per_group_kernel_block_sizes[gid] = group_kernel_block_size
-            for layer_name in group.layer_names:
-                layer_to_gid[layer_name] = gid
-                if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    layer_spec = group_spec.kv_cache_specs.get(layer_name)
-                    if layer_spec is None:
-                        raise ValueError(
-                            "Draft cache group does not contain a spec "
-                            f"for {layer_name}"
-                        )
-                    layer_to_spec[layer_name] = layer_spec
-                else:
-                    layer_to_spec[layer_name] = group_spec
-
-        missing_layers = self._draft_attn_layer_names - layer_to_spec.keys()
-        if missing_layers:
-            raise ValueError(
-                "Draft KV cache configuration is missing layers: "
-                f"{sorted(missing_layers)}"
-            )
-
-        def is_main_attention_spec(spec: KVCacheSpec) -> bool:
-            return (
-                isinstance(spec, FullAttentionSpec)
-                and not isinstance(spec, MLAAttentionSpec)
-                and spec.head_size_v > 0
-            )
-
-        primary_candidates = {
-            layer_to_gid[layer_name]
-            for layer_name in self._draft_attn_layer_names
-            if is_main_attention_spec(layer_to_spec[layer_name])
-        }
-        draft_gids = {
-            layer_to_gid[layer_name] for layer_name in self._draft_attn_layer_names
-        }
-        if not draft_gids:
-            raise ValueError("MTP did not register any draft cache layers")
-        if len(primary_candidates) != 1:
-            raise ValueError(
-                "MTP requires exactly one main attention KV cache "
-                f"group, got {sorted(primary_candidates)}"
-            )
-        self.kv_cache_gid = next(iter(primary_candidates))
-        self._draft_uses_multiple_kv_groups = len(draft_gids) > 1
-
-        attention_groups: dict[
-            tuple[tuple[str, str], int, KVCacheSpec], AttentionGroup
-        ] = {}
-        for layer_name in sorted(self._draft_attn_layer_names):
-            attn_backend = all_attn_layers[layer_name].get_attn_backend()
-            gid = layer_to_gid[layer_name]
-            layer_spec = layer_to_spec[layer_name]
-            group_key = (attn_backend.full_cls_name(), gid, layer_spec)
-            attn_group = attention_groups.get(group_key)
-            if attn_group is None:
-                attn_group = AttentionGroup(
-                    backend=attn_backend,
-                    layer_names=[layer_name],
-                    kv_cache_spec=layer_spec,
-                    kv_cache_group_id=gid,
-                )
-                attn_group.create_metadata_builders(
-                    self.vllm_config,
-                    self.device,
-                    kernel_block_size=self._per_group_kernel_block_sizes[gid],
-                )
-                attention_groups[group_key] = attn_group
-            else:
-                attn_group.layer_names.append(layer_name)
-
-        self.draft_attn_groups = sorted(
-            attention_groups.values(),
-            key=lambda group: (
-                group.kv_cache_group_id != self.kv_cache_gid,
-                group.kv_cache_group_id,
-                group.backend.full_cls_name(),
-                group.layer_names[0],
-            ),
-        )
-        self.block_size = self._per_group_kernel_block_sizes[self.kv_cache_gid]
-        logger.debug(
-            "Using primary KV cache group %d and block size %d for "
-            "drafting across groups %s",
-            self.kv_cache_gid,
-            self.block_size,
-            sorted(draft_gids),
-        )
 
     def _determine_batch_execution_and_padding(
         self,
