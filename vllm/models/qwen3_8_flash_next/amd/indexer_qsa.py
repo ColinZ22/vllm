@@ -103,6 +103,9 @@ class QSAIndexer(nn.Module):
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.rotary_emb = rotary_emb
         self.prefix = prefix
+        # MTP step 0 selects the target-aligned rows; later steps reuse them
+        # while continuing to update the QSA side cache.
+        self.skip_topk = False
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -284,6 +287,9 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
+            # Preserve step-0 indices when later MTP steps reuse the buffer.
+            if self.skip_topk and out is not None:
+                return out
             result = torch.full(
                 (hidden_states.shape[0], self.output_width),
                 -1,
@@ -305,6 +311,10 @@ class QSAIndexer(nn.Module):
             raw_metadata,
             compressed_metadata,
         )
+        if self.skip_topk:
+            if out is None:
+                raise RuntimeError("QSA top-k reuse requires an output buffer")
+            return out
         return self._select(q, compressed_metadata, out)
 
 

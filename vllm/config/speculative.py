@@ -138,6 +138,9 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    index_share_for_mtp_iteration: bool | None = None
+    """Override whether MTP iterations reuse the first step's sparse indices.
+    If `None`, use the value from the draft model's Hugging Face config."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -336,6 +339,15 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
+        if self.method == "mtp" and self.draft_model_config is not None:
+            factors.append(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "index_share_for_mtp_iteration",
+                    False,
+                )
+            )
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -523,12 +535,16 @@ class SpeculativeConfig:
                 "mtp_num_hidden_layers",
                 getattr(text_config, "num_nextn_predict_layers", None),
             )
-            # hc_count is the HC stream multiplier for Qwen MTP feedback.
+            share_mtp_indices = getattr(
+                text_config, "index_share_for_mtp_iteration", False
+            )
             hf_config.update(
                 {
+                    # hc_count is the HC stream multiplier for Qwen MTP feedback.
                     "hc_mult": int(text_config.hc_count),
                     "n_predict": n_predict,
                     "architectures": ["Qwen3_8FlashNextMTP"],
+                    "index_share_for_mtp_iteration": share_mtp_indices,
                 }
             )
 
@@ -1160,6 +1176,15 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+
+        if self.index_share_for_mtp_iteration is not None:
+            if self.method != "mtp" or self.draft_model_config is None:
+                raise ValueError(
+                    "index_share_for_mtp_iteration is only supported with method='mtp'"
+                )
+            self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
+                self.index_share_for_mtp_iteration
+            )
 
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")

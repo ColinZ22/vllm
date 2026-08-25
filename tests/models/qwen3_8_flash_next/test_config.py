@@ -102,6 +102,38 @@ def test_qwen3_8_flash_next_mtp_returns_sample_and_multi_streams() -> None:
     assert returned_multi_hidden is multi_hidden
 
 
+def _bare_qsa_mtp(topk_indices: torch.Tensor):
+    from vllm.models.qwen3_8_flash_next.nvidia.mtp import (
+        Qwen3_8FlashNextMultiTokenPredictor,
+    )
+
+    model = object.__new__(Qwen3_8FlashNextMultiTokenPredictor)
+    torch.nn.Module.__init__(model)
+    attention = SimpleNamespace(
+        indexer=SimpleNamespace(skip_topk=False),
+        topk_indices_buffer=topk_indices.clone(),
+    )
+    model.layers = [SimpleNamespace(self_attn=attention)]
+    return model, attention
+
+
+def test_qwen3_8_flash_next_mtp_toggles_qsa_selection() -> None:
+    model, attention = _bare_qsa_mtp(torch.empty(2, 3, dtype=torch.int32))
+
+    model.set_skip_topk(True)
+
+    assert attention.indexer.skip_topk
+
+
+def test_qwen3_8_flash_next_mtp_compacts_target_aligned_rows() -> None:
+    rows = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4)
+    model, attention = _bare_qsa_mtp(rows)
+
+    model.compact_topk_indices(torch.tensor([2, 5], dtype=torch.int32))
+
+    torch.testing.assert_close(attention.topk_indices_buffer[:2], rows[[2, 5]])
+
+
 def test_qwen3_8_flash_next_qsa_preserves_indexer_config() -> None:
     config = _text_config(
         indexer_n_heads=2,
@@ -187,6 +219,7 @@ def test_qwen3_8_flash_next_mtp_override_preserves_text_backbone_layout() -> Non
     assert draft_config.hc_mult == draft_config.text_config.hc_count == 2
     assert draft_config.to_dict()["hc_mult"] == 2
     assert draft_config.n_predict == 1
+    assert draft_config.index_share_for_mtp_iteration is False
     assert draft_config.text_config.num_hidden_layers == 2
     assert draft_config.text_config.layer_types == [
         "linear_attention",
@@ -202,6 +235,29 @@ def test_qwen3_8_flash_next_text_mtp_override_sets_hc_mult() -> None:
     assert draft_config.model_type == "qwen3_8_flash_next_mtp"
     assert draft_config.hc_mult == draft_config.hc_count == 2
     assert draft_config.to_dict()["hc_mult"] == 2
+    assert draft_config.index_share_for_mtp_iteration is False
+
+
+@pytest.mark.parametrize("wrapped_config", [False, True])
+def test_qwen3_8_flash_next_mtp_override_exposes_index_share_flag(
+    wrapped_config: bool,
+) -> None:
+    text_config = _text_config(
+        architectures=["Qwen3_8FlashNextForCausalLM"],
+        index_share_for_mtp_iteration=True,
+    )
+    config = (
+        Qwen3_8FlashNextConfig(
+            architectures=["Qwen3_8FlashNextForConditionalGeneration"],
+            text_config=text_config,
+        )
+        if wrapped_config
+        else text_config
+    )
+
+    draft_config = SpeculativeConfig.hf_config_override(config)
+
+    assert draft_config.index_share_for_mtp_iteration is True
 
 
 def test_qwen4_exp_checkpoint_names_load_without_overrides(tmp_path) -> None:

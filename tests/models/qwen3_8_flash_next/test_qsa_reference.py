@@ -9,6 +9,7 @@ import torch
 
 from vllm.models.qwen3_8_flash_next.common import qsa_cache
 from vllm.models.qwen3_8_flash_next.common.qsa_cache import QSAMetadataBuilder
+from vllm.models.qwen3_8_flash_next.nvidia import indexer_qsa
 from vllm.models.qwen3_8_flash_next.nvidia import (
     model as _qwen3_8_flash_next_model,  # noqa: F401
 )
@@ -20,6 +21,67 @@ requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
     reason="QSA kernels require CUDA and Triton",
 )
+
+
+def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
+    raw_metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        slot_mapping=torch.arange(2),
+        block_table=torch.empty(0),
+        query_start_loc=torch.arange(3),
+        logical_positions=torch.arange(2),
+    )
+    compressed_metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        slot_mapping=torch.arange(2),
+        k_work_metadata=torch.empty(0),
+    )
+    updates = []
+    selections = []
+    indexer = SimpleNamespace(
+        skip_topk=True,
+        _metadata=lambda: (raw_metadata, compressed_metadata),
+        index_qk_proj=lambda hidden: (torch.zeros(2, 2), None),
+        index_n_heads=1,
+        index_kv_heads=1,
+        index_head_dim=1,
+        raw_key_cache=SimpleNamespace(
+            kv_cache=torch.empty(0),
+            rope_position_cache=None,
+            rope_position_offset=0,
+        ),
+        compressed_key_cache=SimpleNamespace(kv_cache=torch.empty(0)),
+        use_fused_pre_indexer=True,
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(0)),
+        q_layernorm=SimpleNamespace(weight=torch.ones(1), variance_epsilon=1e-6),
+        k_layernorm=SimpleNamespace(weight=torch.ones(1)),
+        compress_ratio=2,
+    )
+
+    monkeypatch.setattr(
+        indexer_qsa,
+        "qsa_pre_indexer",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        qsa_ops,
+        "qsa_select_paged_tokens",
+        lambda *args, **kwargs: selections.append((args, kwargs)),
+    )
+
+    actual = indexer_qsa.QSAIndexer.forward(
+        indexer,
+        torch.zeros(2, 4),
+        torch.tensor([7, 8]),
+        rows,
+    )
+
+    assert actual is rows
+    assert len(updates) == 1
+    assert not selections
 
 
 def _qsa_mqa_paged_reference(
